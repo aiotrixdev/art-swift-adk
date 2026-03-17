@@ -329,9 +329,10 @@ open class BaseSubscription {
         if let msgData = try? JSONSerialization.data(withJSONObject: message),
            let msgStr = String(data: msgData, encoding: .utf8) {
 
-            print("sendMessage")
-            print(msgStr)
-
+            LogTracer.printJSONString(
+                msgStr,
+                title: "Pushing Message Data=============>"
+            )
             websocketHandler.sendMessage(msgStr)
         }
     }

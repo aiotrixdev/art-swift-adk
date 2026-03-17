@@ -3,7 +3,7 @@
 import Foundation
 
 // MARK: - AdkConfig
-public struct AdkConfig {
+public struct AdkConfig: Encodable {
     public var uri: String
     public var authToken: String?
     public var getCredentials: (() -> CredentialStore)?
@@ -20,10 +20,14 @@ public struct AdkConfig {
         self.getCredentials = getCredentials
         self.root = root
     }
+    
+    enum CodingKeys: String, CodingKey {
+            case uri, authToken, root
+        }
 }
 
 // MARK: - CredentialStore
-public struct CredentialStore {
+public struct CredentialStore: Encodable {
     public var environment: String
     public var projectKey: String
     public var orgTitle: String
@@ -52,7 +56,7 @@ public struct CredentialStore {
 }
 
 // MARK: - AuthenticationConfig
-public struct AuthenticationConfig {
+public struct AuthenticationConfig: Encodable  {
     public var environment: String
     public var projectKey: String
     public var orgTitle: String
@@ -81,6 +85,16 @@ public struct AuthenticationConfig {
         self.accessToken = accessToken
         self.getCredentials = getCredentials
     }
+    
+    enum CodingKeys: String, CodingKey {
+           case environment,
+                projectKey,
+                orgTitle,
+                clientID,
+                clientSecret,
+                config,
+                accessToken
+       }
 }
 
 // MARK: - AuthData

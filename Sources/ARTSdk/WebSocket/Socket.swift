@@ -125,8 +125,7 @@ public final class Socket: NSObject, IWebsocketHandler {
     public func connectWebSocket() async throws {
         guard !isConnecting else { return }
         isConnecting = true
-        print("credentials")
-        print(credentials)
+
         
         let auth = try Auth.getInstance(credentials: credentials)
         let authData: AuthData
@@ -252,7 +251,7 @@ public final class Socket: NSObject, IWebsocketHandler {
             projectKey:   credentials.projectKey
         )
         
-        print("Live connection opened \(connection!.connectionId)")
+        print("Live connection opened \(connection!.connectionId)\n")
         emitter.emit("connection", connection!)
         isConnectionActive = true
         startHeartbeat()
@@ -488,8 +487,11 @@ public final class Socket: NSObject, IWebsocketHandler {
     @discardableResult
     public func sendMessage(_ message: String) -> Bool {
         
-        print("sendMessage")
-        print(message)
+        LogTracer.printJSONString(
+            message,
+            title: "Received Web Socket Data=============>"
+        )
+ 
         guard let task = websocket, task.state == .running else {
             pendingSendMessages.append(message)
             print("[ART] WebSocket not open – message buffered")

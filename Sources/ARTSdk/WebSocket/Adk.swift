@@ -69,7 +69,6 @@ open class Adk {
 
     // MARK: - connect
     public func connect(config: ConnectConfig? = nil) async {
-        print("connect")
         isConnectable = true
         state = .connecting
         await initiateSocketConnection()
@@ -143,7 +142,7 @@ open class Adk {
 
         authConfig.config = adkConfig
         authConfig.getCredentials = adkConfig?.getCredentials
-
+        LogTracer.printDATA(authConfig, title: "Auth Config")
         await socket.initiateSocket(credentials: authConfig)
     }
 
@@ -256,9 +255,9 @@ open class Adk {
         req.setValue(creds.projectKey,           forHTTPHeaderField: "ProjectKey")
         req.httpBody = try JSONSerialization.data(withJSONObject: ["public_key": keyPair.publicKey])
 
-        let (_, response) = try await URLSession.shared.data(for: req)
-        print("responseeeeee")
-        print(response)
+        let (data, response) = try await URLSession.shared.data(for: req)
+        LogTracer.printJSONData(data, title: "✅ SavePublicKey Response")
+
         guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
             throw ARTError.serverError("Error updating keypair")
         }
