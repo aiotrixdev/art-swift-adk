@@ -59,9 +59,7 @@ public final class LiveObjSubscription: BaseSubscription {
         guard let connection = websocketHandler.getConnection() else { return }
 
         let serializedOps = serializeOps(ops)
-    
-        print("serializedOpsss")
-        print(serializedOps)
+
             Task {
                 try? await self.pushArray(event: "merge", data: serializedOps)
             }

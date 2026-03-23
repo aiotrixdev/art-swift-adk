@@ -61,7 +61,7 @@ public final class Socket: NSObject, IWebsocketHandler {
             endpoint: Constant.LPOLL,
             getAuthHeaders: { [weak self] in
                 guard let self else { return [:] }
-                let auth = try Auth.getInstance()
+                let auth = try Auth.getInstance(credentials: self.credentials)
                 _ = try await auth.authenticate()
                 let authData = auth.getAuthData()
                 let creds    = auth.getCredentials()
@@ -92,12 +92,13 @@ public final class Socket: NSObject, IWebsocketHandler {
         return _instance!
     }
     
+    
     // MARK: - initiateSocket
     public func initiateSocket(credentials: AuthenticationConfig) async {
         guard websocket == nil || !isConnectionActive else { return }
         self.credentials = credentials
         
-        // 1. Try WebSocket
+        // 1.  WebSocket
         do {
             try await connectWebSocket()
             pullSource = "socket"; pushSource = "socket"
@@ -106,7 +107,7 @@ public final class Socket: NSObject, IWebsocketHandler {
             print("[ART] WebSocket failed, trying SSE: \(error)")
         }
         
-        // 2. Try SSE
+        // 2. SSE
         do {
             try await connectSSE()
             pullSource = "sse"; pushSource = "http"
@@ -152,6 +153,8 @@ public final class Socket: NSObject, IWebsocketHandler {
             throw ARTError.invalidPath("Could not build WebSocket URL")
         }
         
+        print("wsURL")
+        print(wsURL)
         await safeClose()
         
         // Handshake with timeout
@@ -163,6 +166,7 @@ public final class Socket: NSObject, IWebsocketHandler {
             group.addTask { [weak self] in
                 guard let self else { return }
                 let task = self.urlSession.webSocketTask(with: wsURL)
+              
                 task.resume()
                 self.websocket = task
                 self.isConnecting = false
@@ -190,6 +194,7 @@ public final class Socket: NSObject, IWebsocketHandler {
     
     // MARK: - connectSSE
     private func connectSSE() async throws {
+        print("connectSSE")
         let auth     = try Auth.getInstance(credentials: credentials)
         let authData = try await auth.authenticate()
         
@@ -202,6 +207,8 @@ public final class Socket: NSObject, IWebsocketHandler {
         ]
         guard let sseURL = components.url else { throw ARTError.invalidPath("Bad SSE URL") }
         
+        print("sseURL")
+        print(sseURL)
         sseTask = Task { [weak self] in
             guard let self else { return }
             
@@ -270,6 +277,7 @@ public final class Socket: NSObject, IWebsocketHandler {
     
     // MARK: - IWebsocketHandler: pushForSecureLine
     public func pushForSecureLine(event: String, data: Any, listen: Bool) async throws -> Any? {
+        print("pushForSecureLine")
         let connId = connection?.connectionId ?? ""
         let rand   = String(Int.random(in: 0..<1_000_000), radix: 36)
         let refId  = "\(connId)_secure_\(Int(Date().timeIntervalSince1970 * 1000))_\(rand)"
@@ -296,6 +304,9 @@ public final class Socket: NSObject, IWebsocketHandler {
         guard let msgData = try? JSONSerialization.data(withJSONObject: payload),
               let msgStr  = String(data: msgData, encoding: .utf8) else { return nil }
         
+        
+        print("msgStr")
+        print(msgStr)
         if !listen {
             _ = sendMessage(msgStr)
             return nil
@@ -346,11 +357,16 @@ public final class Socket: NSObject, IWebsocketHandler {
                 websocketHandler: self, process: "subscribe"
             )
         }
+        print("subscription")
+        print(subscription)
         subscriptions[channel] = subscription
-        
+       
         // Replay buffered messages
         if let buf = pendingIncomingMessages[channel] {
             for item in buf {
+                print("\nitem.payload:\n")
+                print(item.payload)
+                print("\n")
                 await subscription.handleMessage(event: item.event, payload: item.payload)
             }
             pendingIncomingMessages.removeValue(forKey: channel)
@@ -574,10 +590,6 @@ public final class Socket: NSObject, IWebsocketHandler {
     public func decrypt(_ encryptedHash: String, senderPublicKey: String) async throws -> String {
         return try await decrypt(encryptedHash, senderPublicKey)
     }
-    
-    
-    
-    
     
     
     // MARK: - Receive loop
