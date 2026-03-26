@@ -223,7 +223,16 @@ public final class CRDT {
     private let minFlushMs: Double = 50
     private var trailingTimer: Task<Void, Never>?
     private let queue = DispatchQueue(label: "crdt.queue", qos: .userInitiated)
-    
+    private let snapshotLock = NSRecursiveLock()
+
+    /// Thread-safe snapshot access. Wraps lock/unlock in a nonisolated
+    /// synchronous context so Swift 6 doesn't warn about locks in async code.
+    private nonisolated func withSnapshotLock<T>(_ body: () -> T) -> T {
+        snapshotLock.lock()
+        defer { snapshotLock.unlock() }
+        return body()
+    }
+
     // MARK: Init
     public init(initial: LDMap, mergeCallback: @escaping ([CRDTOperation]) -> Void) {
         self.snapshot = initial
@@ -269,7 +278,8 @@ public final class CRDT {
 
         if ops.isEmpty { return }
 
-        merge(ops)
+        withSnapshotLock { merge(ops) }
+
         mergeCallback(ops)
     }
     
@@ -351,6 +361,7 @@ public final class CRDT {
     // MARK: - Navigation helpers
     
     internal func getContainerAt(path: [String]) -> LDValue? {
+        snapshotLock.lock(); defer { snapshotLock.unlock() }
         var node: LDValue = .map(snapshot)
         for seg in path {
             switch node {
@@ -371,6 +382,7 @@ public final class CRDT {
     }
     
     internal func readJSONAt(path: [String]) -> Any? {
+        snapshotLock.lock(); defer { snapshotLock.unlock() }
         var node: LDValue = .map(snapshot)
         for seg in path {
             switch node {
@@ -388,6 +400,7 @@ public final class CRDT {
     
     // Navigate to the node at path (throws if not found)
     private func navigate(path: [String]) throws -> LDValue {
+        snapshotLock.lock(); defer { snapshotLock.unlock() }
         var node: LDValue = .map(snapshot)
         for (i, seg) in path.enumerated() {
             if i == 0 && seg == "index" { continue }
@@ -408,6 +421,7 @@ public final class CRDT {
     // Navigate to the PARENT container; forceCreate creates missing maps
     @discardableResult
     private func navigateToParent(path: [String], forceCreate: Bool) throws -> LDContainer {
+        snapshotLock.lock(); defer { snapshotLock.unlock() }
         var node: LDContainer = .map(snapshot)
         for i in 0..<path.count - 1 {
             let seg = path[i]
@@ -444,6 +458,7 @@ public final class CRDT {
     
     // Auto-create missing nested maps (used in merge)
     private func ensureMapParents(root: LDMap, path: [String], ts: Int, replicaId: String) {
+        snapshotLock.lock(); defer { snapshotLock.unlock() }
         var node: LDContainer = .map(root)
         for i in 0..<path.count - 1 {
             let seg = path[i]
@@ -477,6 +492,7 @@ public final class CRDT {
     // MARK: - Array container helpers
     @discardableResult
     internal func ensureArrayContainer(path: [String]) -> LDArray {
+        snapshotLock.lock(); defer { snapshotLock.unlock() }
         if let existing = getContainerAt(path: path), case .array(let a) = existing { return a }
         let newArr = LDArray(meta: defaultMeta(replicaId: clientReplicaId))
         let key = path.last ?? ""
@@ -515,12 +531,16 @@ public final class CRDT {
     }
     
     private func baseIdsFor(path: [String]) -> [String] {
+        snapshotLock.lock(); defer { snapshotLock.unlock() }
         guard let cont = getContainerAt(path: path), case .array(let a) = cont else { return [] }
         return linearizeRGA(a)
     }
     
     internal func visibleIdsFor(path: [String]) -> [String] {
+        snapshotLock.lock()
         var ids = baseIdsFor(path: path)
+        snapshotLock.unlock()
+
         for op in pendingArrayOps(for: path) {
             switch op {
             case .arrayPush(_, let ref, let entry, _, _):
@@ -546,6 +566,7 @@ public final class CRDT {
     
     // MARK: - ensureParents (for object property assignment)
     internal func ensureParentsOps(full: [String]) -> [CRDTOperation] {
+        snapshotLock.lock(); defer { snapshotLock.unlock() }
         var ops: [CRDTOperation] = []
         for i in 0..<full.count - 1 {
             let sub = Array(full.prefix(i + 1))
@@ -565,6 +586,7 @@ public final class CRDT {
     
     // MARK: - Merge
     public func merge(_ ops: [CRDTOperation]) {
+        snapshotLock.lock(); defer { snapshotLock.unlock() }
         for op in ops {
             switch op {
             case .arrayPush(let path, let ref, let entry, let ts, let replicaId):
@@ -596,7 +618,6 @@ public final class CRDT {
                 if path.count == 1 {
                     snapshot.index.removeValue(forKey: key)
                 } else {
-                    let parentPath = Array(path.dropLast())
                     if let parent = try? navigateToParent(path: path, forceCreate: false) {
                         switch parent {
                         case .map(let m): m.index.removeValue(forKey: key)
@@ -627,30 +648,16 @@ public final class CRDT {
                 }
                 
             case .replace(let path, let entry, let ts, let replicaId):
-                
+
                 ensureMapParents(root: snapshot, path: path, ts: Int(ts), replicaId: replicaId)
-                
+
                 let key = path.last ?? ""
                 var parent: LDContainer
-                
+
                 do {
                     parent = try navigateToParent(path: path, forceCreate: true)
                 } catch {
-                    continue
-                }
-                
-                switch parent {
-                case .map(let m):
-                    m.index[key] = entry
-                case .array(let a):
-                    a.entries[key] = entry
-                }
-                ensureMapParents(root: snapshot, path: path, ts: ts, replicaId: replicaId)
-                
-                do {
-                    parent = try navigateToParent(path: path, forceCreate: (op.self is Never) ? false : true)
-                } catch {
-                    // fallback: array element upsert
+                    // Fallback: array element upsert
                     if path.count >= 3 {
                         let arrayPath = Array(path.dropLast(2))
                         let elemId = path[path.count - 2]
@@ -667,6 +674,7 @@ public final class CRDT {
                         } else { continue }
                     } else { continue }
                 }
+
                 switch parent {
                 case .map(let m): m.index[key] = entry
                 case .array(let a): a.entries[key] = entry
@@ -702,18 +710,23 @@ public final class CRDT {
         
         let execute: () async -> Any? = { [weak self] in
             guard let self else { return nil }
-            return (try? self.navigate(path: segments)).map { toAny($0) }
+            return self.withSnapshotLock {
+                (try? self.navigate(path: segments)).map { toAny($0) }
+            }
         }
-        
+
         let listen: (@escaping CRDTListener) async -> () -> Void = { [weak self] cb in
             guard let self else { return {} }
             let key = path ?? ""
-            queue.sync {
+            self.queue.sync {
                 self.listeners[key, default: []].append(cb)
             }
-            cb((try? self.navigate(path: segments)).map { toAny($0) } ?? NSNull())
+            let initialValue = self.withSnapshotLock {
+                (try? self.navigate(path: segments)).map { toAny($0) } ?? NSNull()
+            }
+            cb(initialValue)
             return { [weak self] in
-                self?.listeners[key]?.removeAll { _ in true }  // simplified removal
+                self?.listeners[key]?.removeAll { _ in true }
             }
         }
         

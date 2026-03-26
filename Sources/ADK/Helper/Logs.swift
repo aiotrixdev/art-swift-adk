@@ -84,8 +84,6 @@ final class TracedURLSessionDelegate: NSObject,
     }
 }
 
-import Foundation
-
 enum LogTracer {
     
     #if DEBUG

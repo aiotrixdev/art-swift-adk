@@ -104,7 +104,6 @@ open class Adk {
         await socket.closeWebSocket(clearConnection: true)
         state = .stopped
         socket.isConnectionActive = false
-        socket.pendingSendMessages = []
     }
 
     // MARK: - getState
@@ -165,12 +164,12 @@ open class Adk {
             guard let self else { return }
             if self.reconnectAttempts < self.maxReconnectAttempts {
                 self.reconnectAttempts += 1
-                print("[ART] Reconnecting in \(self.reconnectDelay / 1000)s (attempt \(self.reconnectAttempts))")
+                LogTracer.log("[ART] Reconnecting in \(self.reconnectDelay / 1000)s (attempt \(self.reconnectAttempts))")
                 try? await Task.sleep(nanoseconds: UInt64(self.reconnectDelay * 1_000_000))
                 await self.connect()
                 self.reconnectDelay = min(self.reconnectDelay + 2000, self.maxDelay)
             } else {
-                print("[ART] Max reconnect attempts reached. Retrying in \(self.maxDelay / 1000)s")
+                LogTracer.log("[ART] Max reconnect attempts reached. Retrying in \(self.maxDelay / 1000)s")
                 try? await Task.sleep(nanoseconds: UInt64(self.maxDelay * 1_000_000))
                 await self.connect()
             }
@@ -246,7 +245,10 @@ open class Adk {
         let authData = auth.getAuthData()
         let creds    = auth.getCredentials()
 
-        var req = URLRequest(url: URL(string: "\(Constant.BASE_URL)/v1/update-publickey")!)
+        guard let url = URL(string: "\(Constant.BASE_URL)/v1/update-publickey") else {
+            throw ARTError.serverError("Malformed public key URL")
+        }
+        var req = URLRequest(url: url)
         req.httpMethod = "POST"
         req.setValue("application/json",        forHTTPHeaderField: "Content-Type")
         req.setValue("Bearer \(authData.accessToken)", forHTTPHeaderField: "Authorization")
@@ -266,8 +268,8 @@ open class Adk {
     
     // MARK: - Key pair management
     public func generateKeyPair() async throws -> KeyPairType {
-         var keyPair=try CryptoBox.generateKeyPair()
-         try?await setKeyPair(keyPair)
+        let keyPair = try CryptoBox.generateKeyPair()
+        try await setKeyPair(keyPair)
         return keyPair
     }
 
@@ -292,7 +294,10 @@ open class Adk {
             urlStr += "?\(qs)"
         }
 
-        var req = URLRequest(url: URL(string: urlStr)!)
+        guard let url = URL(string: urlStr) else {
+            throw ARTError.serverError("Malformed API URL: \(endpoint)")
+        }
+        var req = URLRequest(url: url)
         req.httpMethod = options.method.uppercased()
         req.setValue("Bearer \(authData.accessToken)", forHTTPHeaderField: "Authorization")
         req.setValue("application/json",               forHTTPHeaderField: "Accept")

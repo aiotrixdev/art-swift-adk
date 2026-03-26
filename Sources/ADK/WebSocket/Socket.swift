@@ -25,8 +25,8 @@ public final class Socket: NSObject, IWebsocketHandler {
     private var connection: ConnectionDetail? = nil
     public var isConnectionActive: Bool = false
     private var heartbeatTask: Task<Void, Never>?
-    public var pendingSendMessages: [String] = []
-    public var secureCallbacks: [String: (Any) -> Void] = [:]
+    private var pendingSendMessages: [String] = []
+    private var secureCallbacks: [String: (Any) -> Void] = [:]
     private var pendingIncomingMessages: [String: [(event: String, payload: [String: Any])]] = [:]
     public var encrypt: (String, String) async throws -> String
     public var decrypt: (String, String) async throws -> String
@@ -34,7 +34,7 @@ public final class Socket: NSObject, IWebsocketHandler {
     private var pushSource: String = "socket"
     private var lpClient: LongPollClient!
     private var isConnecting:      Bool = false
-    public var isReConnecting:     Bool = false
+    internal var isReConnecting:     Bool = false
     private var autoReconnect:     Bool = false
     
     private var sseTask: Task<Void, Never>?
@@ -46,7 +46,16 @@ public final class Socket: NSObject, IWebsocketHandler {
     // MARK: - Connection waiter
     private var connectionContinuations: [CheckedContinuation<Void, Never>] = []
     private let continuationLock = NSLock()
-    
+    private let socketLock = NSRecursiveLock()
+
+    /// Thread-safe access to shared state. Wraps lock/unlock in a nonisolated
+    /// synchronous context so Swift 6 doesn't warn about locks in async code.
+    private nonisolated func withSocketLock<T>(_ body: () -> T) -> T {
+        socketLock.lock()
+        defer { socketLock.unlock() }
+        return body()
+    }
+
     // MARK: - Init (private)
     private init(
         encrypt: @escaping (String, String) async throws -> String,
@@ -76,7 +85,7 @@ public final class Socket: NSObject, IWebsocketHandler {
                 self?.processIncomingMessages(msgs)
             },
             onError: { err in
-                print("[ART] LP error: \(err)")
+                LogTracer.log("[ART] LP error: \(err)")
             }
         ))
     }
@@ -104,7 +113,7 @@ public final class Socket: NSObject, IWebsocketHandler {
             pullSource = "socket"; pushSource = "socket"
             return
         } catch {
-            print("[ART] WebSocket failed, trying SSE: \(error)")
+            LogTracer.log("[ART] WebSocket failed, trying SSE: \(error)")
         }
         
         // 2. SSE
@@ -113,7 +122,7 @@ public final class Socket: NSObject, IWebsocketHandler {
             pullSource = "sse"; pushSource = "http"
             return
         } catch {
-            print("[ART] SSE failed, falling back to LongPoll: \(error)")
+            LogTracer.log("[ART] SSE failed, falling back to LongPoll: \(error)")
         }
         
         // 3. LongPoll
@@ -133,7 +142,7 @@ public final class Socket: NSObject, IWebsocketHandler {
         do {
             authData = try await auth.authenticate(forceAuth: isReConnecting)
         } catch {
-            print("[ART] Authentication failed: \(error)")
+            LogTracer.log("[ART] Authentication failed: \(error)")
             isConnecting = false
             emitter.emit("close", error)
             throw error
@@ -153,8 +162,7 @@ public final class Socket: NSObject, IWebsocketHandler {
             throw ARTError.invalidPath("Could not build WebSocket URL")
         }
         
-        print("wsURL")
-        print(wsURL)
+        LogTracer.log("[ART] WebSocket URL: \(wsURL)")
         await safeClose()
         
         // Handshake with timeout
@@ -194,7 +202,7 @@ public final class Socket: NSObject, IWebsocketHandler {
     
     // MARK: - connectSSE
     private func connectSSE() async throws {
-        print("connectSSE")
+        LogTracer.log("[ART] Connecting SSE")
         let auth     = try Auth.getInstance(credentials: credentials)
         let authData = try await auth.authenticate()
         
@@ -207,8 +215,7 @@ public final class Socket: NSObject, IWebsocketHandler {
         ]
         guard let sseURL = components.url else { throw ARTError.invalidPath("Bad SSE URL") }
         
-        print("sseURL")
-        print(sseURL)
+        LogTracer.log("[ART] SSE URL: \(sseURL)")
         sseTask = Task { [weak self] in
             guard let self else { return }
             
@@ -239,7 +246,7 @@ public final class Socket: NSObject, IWebsocketHandler {
                 }
                 
             } catch {
-                print("[ART] SSE error:", error)
+                LogTracer.log("[ART] SSE error: \(error)")
             }
         }
     }
@@ -258,26 +265,30 @@ public final class Socket: NSObject, IWebsocketHandler {
             projectKey:   credentials.projectKey
         )
         
-        print("Live connection opened \(connection!.connectionId)\n")
+        LogTracer.log("[ART] Live connection opened \(connection?.connectionId ?? "")")
         emitter.emit("connection", connection!)
         isConnectionActive = true
         startHeartbeat()
         resolveWaiters()
         
         // Flush pending messages
-        let queued = pendingSendMessages
-        pendingSendMessages = []
+        let (queued, subs, intercepts) = withSocketLock { () -> ([String], [BaseSubscription], [Interception]) in
+            let q = pendingSendMessages
+            pendingSendMessages = []
+            return (q, Array(subscriptions.values), Array(interceptors.values))
+        }
+
         queued.forEach { _ = sendMessage($0) }
-        
+
         if autoReconnect {
-            subscriptions.values.forEach { $0.reconnect() }
-            interceptors.values.forEach { $0.reconnect() }
+            subs.forEach { $0.reconnect() }
+            intercepts.forEach { $0.reconnect() }
         }
     }
     
     // MARK: - IWebsocketHandler: pushForSecureLine
     public func pushForSecureLine(event: String, data: Any, listen: Bool) async throws -> Any? {
-        print("pushForSecureLine")
+        LogTracer.log("[ART] pushForSecureLine")
         let connId = connection?.connectionId ?? ""
         let rand   = String(Int.random(in: 0..<1_000_000), radix: 36)
         let refId  = "\(connId)_secure_\(Int(Date().timeIntervalSince1970 * 1000))_\(rand)"
@@ -305,8 +316,7 @@ public final class Socket: NSObject, IWebsocketHandler {
               let msgStr  = String(data: msgData, encoding: .utf8) else { return nil }
         
         
-        print("msgStr")
-        print(msgStr)
+        LogTracer.log("[ART] Secure message: \(msgStr)")
         if !listen {
             _ = sendMessage(msgStr)
             return nil
@@ -314,14 +324,27 @@ public final class Socket: NSObject, IWebsocketHandler {
         
         return await withCheckedContinuation { [weak self] (cont: CheckedContinuation<Any?, Never>) in
             guard let self else { cont.resume(returning: nil); return }
-            secureCallbacks["secure-\(refId)"] = { result in cont.resume(returning: result) }
-            _ = sendMessage(msgStr)
+            let callbackKey = "secure-\(refId)"
+            self.withSocketLock {
+                self.secureCallbacks[callbackKey] = { result in cont.resume(returning: result) }
+            }
+            _ = self.sendMessage(msgStr)
+
+            // Timeout to prevent hanging forever if server never responds
+            Task { [weak self] in
+                try? await Task.sleep(nanoseconds: 30_000_000_000) // 30s
+                guard let self else { return }
+                let cb = self.withSocketLock { self.secureCallbacks.removeValue(forKey: callbackKey) }
+                if cb != nil {
+                    cont.resume(returning: nil)
+                }
+            }
         }
     }
     
     // MARK: - IWebsocketHandler: removeSubscription
     public func removeSubscription(channel: String) {
-        subscriptions.removeValue(forKey: channel)
+        _ = withSocketLock { subscriptions.removeValue(forKey: channel) }
     }
     
     
@@ -335,7 +358,9 @@ public final class Socket: NSObject, IWebsocketHandler {
         await wait()
         let connectionId = connection?.connectionId ?? ""
         
-        if let existing = subscriptions[channel] {
+        let existing = withSocketLock { subscriptions[channel] }
+
+        if let existing = existing {
             await existing.subscribe()
             return existing
         }
@@ -357,19 +382,18 @@ public final class Socket: NSObject, IWebsocketHandler {
                 websocketHandler: self, process: "subscribe"
             )
         }
-        print("subscription")
-        print(subscription)
-        subscriptions[channel] = subscription
-       
+        LogTracer.log("[ART] Subscription created: \(channel)")
+        let buf = withSocketLock { () -> [(event: String, payload: [String: Any])]? in
+            subscriptions[channel] = subscription
+            return pendingIncomingMessages.removeValue(forKey: channel)
+        }
+
         // Replay buffered messages
-        if let buf = pendingIncomingMessages[channel] {
+        if let buf = buf {
             for item in buf {
-                print("\nitem.payload:\n")
-                print(item.payload)
-                print("\n")
+                LogTracer.log("[ART] Replaying buffered message for \(channel)")
                 await subscription.handleMessage(event: item.event, payload: item.payload)
             }
-            pendingIncomingMessages.removeValue(forKey: channel)
         }
         
         return subscription
@@ -393,11 +417,12 @@ public final class Socket: NSObject, IWebsocketHandler {
     ) async throws -> Interception {
         await wait()
         
-        if let existing = interceptors[interceptor] { return existing }
-        
+        let existing = withSocketLock { interceptors[interceptor] }
+        if let existing = existing { return existing }
+
         let interception = Interception(interceptor: interceptor, fn: fn, websocketHandler: self)
         try await interception.validateInterception()
-        interceptors[interceptor] = interception
+        withSocketLock { interceptors[interceptor] = interception }
         return interception
     }
     
@@ -423,7 +448,7 @@ public final class Socket: NSObject, IWebsocketHandler {
     
     private func handleIncomingMessage(_ parsed: [String: Any]) {
         guard let channel = parsed["channel"] as? String else {
-            print("[ART] Message missing channel: \(parsed)")
+            LogTracer.log("[ART] Message missing channel")
             return
         }
         
@@ -443,7 +468,8 @@ public final class Socket: NSObject, IWebsocketHandler {
         // art_secure → secure callback
         if channel == "art_secure" {
             let key = "secure-\(refId)"
-            if let cb = secureCallbacks[key] {
+            let cb = withSocketLock { secureCallbacks.removeValue(forKey: key) }
+            if let cb = cb {
                 var dataDict: [String: Any] = ["channel": channel, "namespace": namespace, "ref_id": refId, "event": event]
                 if let dataStr = rawData as? String,
                    let jsonData = dataStr.data(using: .utf8),
@@ -451,13 +477,12 @@ public final class Socket: NSObject, IWebsocketHandler {
                     dataDict["data"] = innerParsed
                 }
                 cb(["data": dataDict["data"] as Any, "channel": channel, "namespace": namespace, "ref_id": refId, "event": event])
-                secureCallbacks.removeValue(forKey: key)
             }
             return
         }
         
         if channel.isEmpty || (event.isEmpty && returnFlag != "SA") {
-            print("[ART] Message without channel or event: \(parsed)")
+            LogTracer.log("[ART] Message without channel or event")
             return
         }
         
@@ -470,10 +495,11 @@ public final class Socket: NSObject, IWebsocketHandler {
         
         // Interceptor routing
         if let iName = interceptorName, !iName.isEmpty {
-            if let interception = interceptors[iName] {
+            let interception = withSocketLock { interceptors[iName] }
+            if let interception = interception {
                 Task { await interception.handleMessage(channel: channel, data: payload) }
             } else {
-                print("[ART] No interception for: \(iName)")
+                LogTracer.log("[ART] No interception for: \(iName)")
             }
             return
         }
@@ -482,11 +508,13 @@ public final class Socket: NSObject, IWebsocketHandler {
         var subKey = channel
         if !namespace.isEmpty { subKey += ":\(namespace)" }
         
-        if let sub = subscriptions[subKey] {
+        let sub = withSocketLock { subscriptions[subKey] }
+
+        if let sub = sub {
             Task { await sub.handleMessage(event: event, payload: payload) }
         } else {
-            print("[ART] No subscription for \(subKey) – buffering")
-            pendingIncomingMessages[subKey, default: []].append((event: event, payload: payload))
+            withSocketLock { pendingIncomingMessages[subKey, default: []].append((event: event, payload: payload)) }
+            LogTracer.log("[ART] No subscription for \(subKey) – buffering")
         }
     }
     
@@ -494,7 +522,7 @@ public final class Socket: NSObject, IWebsocketHandler {
     // MARK: - HTTP poll switch
     private func switchToHttpPoll() {
         guard pullSource != "http" else { return }
-        print("[ART] Shifting to HTTP poll")
+        LogTracer.log("[ART] Shifting to HTTP poll")
         pullSource = "http"; pushSource = "http"
         lpClient.start(connectionId: connection?.connectionId ?? "")
     }
@@ -509,8 +537,8 @@ public final class Socket: NSObject, IWebsocketHandler {
         )
  
         guard let task = websocket, task.state == .running else {
-            pendingSendMessages.append(message)
-            print("[ART] WebSocket not open – message buffered")
+            withSocketLock { pendingSendMessages.append(message) }
+            LogTracer.log("[ART] WebSocket not open – message buffered")
             return false
         }
         task.send(.string(message)) { [weak self] error in
@@ -531,10 +559,12 @@ public final class Socket: NSObject, IWebsocketHandler {
         sseTask?.cancel(); sseTask = nil
         
         if clearConnection {
-            pendingIncomingMessages.removeAll()
-            pendingSendMessages.removeAll()
-            subscriptions.removeAll()
-            interceptors.removeAll()
+            withSocketLock {
+                pendingIncomingMessages.removeAll()
+                pendingSendMessages.removeAll()
+                subscriptions.removeAll()
+                interceptors.removeAll()
+            }
         }
         
         heartbeatTask?.cancel(); heartbeatTask = nil
@@ -553,8 +583,10 @@ public final class Socket: NSObject, IWebsocketHandler {
     }
     
     private func runHeartbeatPayload() -> [String: Any] {
-        let subs = subscriptions.map { (k, v) -> [String: Any] in
-            ["name": k, "presenceTracking": v.isListening]
+        let subs = withSocketLock {
+            subscriptions.map { (k, v) -> [String: Any] in
+                ["name": k, "presenceTracking": v.isListening]
+            }
         }
         return ["connectionId": connection?.connectionId as Any, "timestamp": Date().timeIntervalSince1970 * 1000, "subscriptions": subs]
     }
@@ -647,7 +679,7 @@ extension Socket: URLSessionWebSocketDelegate {
         
         let reasonStr = reason.flatMap { String(data: $0, encoding: .utf8) }
         
-        print("[ART] WS closed: \(closeCode) \(reasonStr ?? "")")
+        LogTracer.log("[ART] WS closed: \(closeCode) \(reasonStr ?? "")")
         
         emitter.emit("close", closeCode)
     }

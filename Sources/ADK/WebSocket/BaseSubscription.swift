@@ -66,7 +66,7 @@ open class BaseSubscription {
 
         } catch {
 
-            print("[ART] validateSubscription error:", error)
+            LogTracer.log("[ART] validateSubscription error: \(error)")
         }
     }
     
@@ -76,7 +76,7 @@ open class BaseSubscription {
         callback: @escaping ([String]) -> Void
     ) async throws -> (() async throws -> Void) {
 
-        var previousPresenceData = presenceUsers
+        let previousPresenceData = presenceUsers
 
         if !previousPresenceData.isEmpty {
             callback(previousPresenceData)
@@ -88,9 +88,10 @@ open class BaseSubscription {
             throw ARTError.serverError("Not subscribed for presence")
         }
 
-        emitter.on("art_presence") { payload in
+        emitter.on("art_presence") { [weak self] payload in
 
-            guard let data = payload as? [String: Any],
+            guard let self,
+                  let data = payload as? [String: Any],
                   let usernames = data["usernames"] as? [String],
                   (data["error"] as? Bool ?? false) == false else { return }
 
@@ -124,7 +125,7 @@ open class BaseSubscription {
 
         return {
 
-            try await unsubscribe_from_channel(
+            _ = try await unsubscribe_from_channel(
                 channel: self.channelConfig.channelName,
                 subscriptionID: self.channelConfig.subscriptionID ?? "",
                 process: "presence",
@@ -168,10 +169,10 @@ open class BaseSubscription {
         if let data = try? JSONSerialization.data(withJSONObject: response),
            let str = String(data: data, encoding: .utf8) {
 
-            websocketHandler.sendMessage(str)
+            _ = websocketHandler.sendMessage(str)
         }
     }
-    
+
     // MARK: - Handle ACK
     public func handleMessageAcks(
         event: String,
@@ -212,7 +213,7 @@ open class BaseSubscription {
 
         } catch {
 
-            print("[ART] subscribe error:", error)
+            LogTracer.log("[ART] subscribe error: \(error)")
             isSubscribed = false
         }
     }
@@ -236,7 +237,7 @@ open class BaseSubscription {
             }
 
         } catch {
-            print("[ART] unsubscribe error:", error)
+            LogTracer.log("[ART] unsubscribe error: \(error)")
         }
     }
     
@@ -333,10 +334,10 @@ open class BaseSubscription {
                 msgStr,
                 title: "Pushing Message Data=============>"
             )
-            websocketHandler.sendMessage(msgStr)
+            _ = websocketHandler.sendMessage(msgStr)
         }
     }
-    
+
     public func pushArray(event: String, data: [[String: Any]]) async throws {
 
         await websocketHandler.wait()
@@ -363,9 +364,8 @@ open class BaseSubscription {
 
         if let msgData = try? JSONSerialization.data(withJSONObject: message),
            let msgStr = String(data: msgData, encoding: .utf8) {
-            print("sendcrdtPush")
-            print(msgStr)
-            websocketHandler.sendMessage(msgStr)
+            LogTracer.printJSONString(msgStr, title: "CRDT Push")
+            _ = websocketHandler.sendMessage(msgStr)
         }
     }
 

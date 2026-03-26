@@ -56,13 +56,17 @@ public final class LiveObjSubscription: BaseSubscription {
     private func executeServerMerge(_ ops: [CRDTOperation]) {
 
         guard !ops.isEmpty else { return }
-        guard let connection = websocketHandler.getConnection() else { return }
+        guard websocketHandler.getConnection() != nil else { return }
 
         let serializedOps = serializeOps(ops)
 
-            Task {
-                try? await self.pushArray(event: "merge", data: serializedOps)
+        Task { [weak self] in
+            do {
+                try await self?.pushArray(event: "merge", data: serializedOps)
+            } catch {
+                LogTracer.log("[ART] CRDT merge push failed: \(error)")
             }
+        }
     }
 
     public override func handleMessage(event: String, payload: [String: Any]) async {
@@ -112,7 +116,7 @@ public final class LiveObjSubscription: BaseSubscription {
         }
 
         guard let opsDict = rawOps else {
-            print("⚠️ Failed to parse CRDT ops")
+            LogTracer.log("[ART] Failed to parse CRDT ops")
             return
         }
 
@@ -159,7 +163,7 @@ private func serializeOps(_ sOps: [CRDTOperation]) -> [[String: Any]] {
 }
 
 private func serializeEntry(_ entry: LDEntry) -> [String: Any] {
-    var d: [String: Any] = [
+    let d: [String: Any] = [
         "id": entry.id, "key": entry.key, "type": entry.type.rawValue,
         "value": serializeValue(entry.value, replicaId: entry.meta.replicaId),
         "meta": serializeMeta(entry.meta)

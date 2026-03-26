@@ -9,13 +9,15 @@ public final class Auth {
     public static func getInstance(credentials: AuthenticationConfig? = nil) throws -> Auth {
         lock.lock()
         defer { lock.unlock() }
-        if _instance == nil {
-            guard let creds = credentials else {
-                throw ARTError.forbidden("Auth not initialised – provide credentials on first call")
-            }
-            _instance = Auth(credentials: creds)
+        if let existing = _instance {
+            return existing
         }
-        return _instance!
+        guard let creds = credentials else {
+            throw ARTError.forbidden("Auth not initialised – provide credentials on first call")
+        }
+        let instance = Auth(credentials: creds)
+        _instance = instance
+        return instance
     }
     
     public static func reset() {
@@ -88,7 +90,9 @@ public final class Auth {
             headers["X-pass"] = authToken
         }
         
-        let url = URL(string: "\(Constant.BASE_URL)/auth/token")!
+        guard let url = URL(string: "\(Constant.BASE_URL)/auth/token") else {
+            throw ARTError.authenticationFailed("Malformed auth token URL")
+        }
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
         headers.forEach { req.setValue($1, forHTTPHeaderField: $0) }
@@ -123,7 +127,9 @@ public final class Auth {
             "ProjectKey":  credentials.projectKey,
         ]
         
-        let url = URL(string: "\(Constant.BASE_URL)/auth/token/refresh")!
+        guard let url = URL(string: "\(Constant.BASE_URL)/auth/token/refresh") else {
+            throw ARTError.authenticationFailed("Malformed auth refresh URL")
+        }
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
         headers.forEach { req.setValue($1, forHTTPHeaderField: $0) }
