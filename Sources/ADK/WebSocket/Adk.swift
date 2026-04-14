@@ -258,6 +258,9 @@ open class Adk {
         req.httpBody = try JSONSerialization.data(withJSONObject: ["public_key": keyPair.publicKey])
 
         let (data, response) = try await URLSession.shared.data(for: req)
+        LogTracer.log("keyPair");
+              LogTracer.log(keyPair.privateKey);
+              LogTracer.log(keyPair.publicKey);
         LogTracer.printJSONData(data, title: "✅ SavePublicKey Response")
 
         guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {

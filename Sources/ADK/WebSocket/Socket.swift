@@ -162,7 +162,7 @@ public final class Socket: NSObject, IWebsocketHandler {
             throw ARTError.invalidPath("Could not build WebSocket URL")
         }
         
-        LogTracer.log("[ART] WebSocket URL: \(wsURL)")
+        LogTracer.log("✅ WebSocket URL: \(wsURL)")
         await safeClose()
         
         // Handshake with timeout
@@ -288,7 +288,6 @@ public final class Socket: NSObject, IWebsocketHandler {
     
     // MARK: - IWebsocketHandler: pushForSecureLine
     public func pushForSecureLine(event: String, data: Any, listen: Bool) async throws -> Any? {
-        LogTracer.log("[ART] pushForSecureLine")
         let connId = connection?.connectionId ?? ""
         let rand   = String(Int.random(in: 0..<1_000_000), radix: 36)
         let refId  = "\(connId)_secure_\(Int(Date().timeIntervalSince1970 * 1000))_\(rand)"
@@ -316,7 +315,6 @@ public final class Socket: NSObject, IWebsocketHandler {
               let msgStr  = String(data: msgData, encoding: .utf8) else { return nil }
         
         
-        LogTracer.log("[ART] Secure message: \(msgStr)")
         if !listen {
             _ = sendMessage(msgStr)
             return nil
@@ -532,9 +530,9 @@ public final class Socket: NSObject, IWebsocketHandler {
     public func sendMessage(_ message: String) -> Bool {
         
         LogTracer.printJSONString(
-            message,
-            title: "Received Web Socket Data=============>"
-        )
+              message,
+              title: "Outgoing Socket Data"
+            )
  
         guard let task = websocket, task.state == .running else {
             withSocketLock { pendingSendMessages.append(message) }
@@ -632,7 +630,12 @@ public final class Socket: NSObject, IWebsocketHandler {
                 do {
                     let msg = try await task.receive()
                     switch msg {
-                    case .string(let s): parseIncomingMessage(s)
+                    case .string(let s):
+                        LogTracer.printJSONString(
+                            s,
+                                    title: "Raw incoming socket message"
+                                  );
+                        parseIncomingMessage(s)
                     case .data(let d):
                         if let s = String(data: d, encoding: .utf8) { parseIncomingMessage(s) }
                     @unknown default: break
