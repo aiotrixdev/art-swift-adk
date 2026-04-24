@@ -141,7 +141,6 @@ open class Adk {
 
         authConfig.config = adkConfig
         authConfig.getCredentials = adkConfig?.getCredentials
-        LogTracer.printDATA(authConfig, title: "Auth Config")
         await socket.initiateSocket(credentials: authConfig)
     }
 
@@ -164,12 +163,10 @@ open class Adk {
             guard let self else { return }
             if self.reconnectAttempts < self.maxReconnectAttempts {
                 self.reconnectAttempts += 1
-                LogTracer.log("[ART] Reconnecting in \(self.reconnectDelay / 1000)s (attempt \(self.reconnectAttempts))")
                 try? await Task.sleep(nanoseconds: UInt64(self.reconnectDelay * 1_000_000))
                 await self.connect()
                 self.reconnectDelay = min(self.reconnectDelay + 2000, self.maxDelay)
             } else {
-                LogTracer.log("[ART] Max reconnect attempts reached. Retrying in \(self.maxDelay / 1000)s")
                 try? await Task.sleep(nanoseconds: UInt64(self.maxDelay * 1_000_000))
                 await self.connect()
             }
@@ -258,11 +255,6 @@ open class Adk {
         req.httpBody = try JSONSerialization.data(withJSONObject: ["public_key": keyPair.publicKey])
 
         let (data, response) = try await URLSession.shared.data(for: req)
-        LogTracer.log("keyPair");
-              LogTracer.log(keyPair.privateKey);
-              LogTracer.log(keyPair.publicKey);
-        LogTracer.printJSONData(data, title: "✅ SavePublicKey Response")
-
         guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
             throw ARTError.serverError("Error updating keypair")
         }

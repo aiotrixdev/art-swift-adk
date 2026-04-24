@@ -65,8 +65,7 @@ open class BaseSubscription {
             }
 
         } catch {
-
-            LogTracer.log("[ART] validateSubscription error: \(error)")
+return
         }
     }
     
@@ -212,8 +211,6 @@ open class BaseSubscription {
             channelConfig = config
 
         } catch {
-
-            LogTracer.log("[ART] subscribe error: \(error)")
             isSubscribed = false
         }
     }
@@ -237,7 +234,7 @@ open class BaseSubscription {
             }
 
         } catch {
-            LogTracer.log("[ART] unsubscribe error: \(error)")
+            return
         }
     }
     
@@ -329,11 +326,6 @@ open class BaseSubscription {
 
         if let msgData = try? JSONSerialization.data(withJSONObject: message),
            let msgStr = String(data: msgData, encoding: .utf8) {
-
-            LogTracer.printJSONString(
-                msgStr,
-                title: "Pushing Message Data=============>"
-            )
             _ = websocketHandler.sendMessage(msgStr)
         }
     }
@@ -364,7 +356,6 @@ open class BaseSubscription {
 
         if let msgData = try? JSONSerialization.data(withJSONObject: message),
            let msgStr = String(data: msgData, encoding: .utf8) {
-            LogTracer.printJSONString(msgStr, title: "CRDT Push")
             _ = websocketHandler.sendMessage(msgStr)
         }
     }

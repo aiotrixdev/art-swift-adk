@@ -85,7 +85,6 @@ public final class Socket: NSObject, IWebsocketHandler {
                 self?.processIncomingMessages(msgs)
             },
             onError: { err in
-                LogTracer.log("[ART] LP error: \(err)")
             }
         ))
     }
@@ -113,7 +112,7 @@ public final class Socket: NSObject, IWebsocketHandler {
             pullSource = "socket"; pushSource = "socket"
             return
         } catch {
-            LogTracer.log("[ART] WebSocket failed, trying SSE: \(error)")
+            return
         }
         
         // 2. SSE
@@ -122,7 +121,6 @@ public final class Socket: NSObject, IWebsocketHandler {
             pullSource = "sse"; pushSource = "http"
             return
         } catch {
-            LogTracer.log("[ART] SSE failed, falling back to LongPoll: \(error)")
         }
         
         // 3. LongPoll
@@ -142,7 +140,6 @@ public final class Socket: NSObject, IWebsocketHandler {
         do {
             authData = try await auth.authenticate(forceAuth: isReConnecting)
         } catch {
-            LogTracer.log("[ART] Authentication failed: \(error)")
             isConnecting = false
             emitter.emit("close", error)
             throw error
@@ -162,7 +159,7 @@ public final class Socket: NSObject, IWebsocketHandler {
             throw ARTError.invalidPath("Could not build WebSocket URL")
         }
         
-        LogTracer.log("✅ WebSocket URL: \(wsURL)")
+
         await safeClose()
         
         // Handshake with timeout
@@ -202,7 +199,6 @@ public final class Socket: NSObject, IWebsocketHandler {
     
     // MARK: - connectSSE
     private func connectSSE() async throws {
-        LogTracer.log("[ART] Connecting SSE")
         let auth     = try Auth.getInstance(credentials: credentials)
         let authData = try await auth.authenticate()
         
@@ -215,7 +211,6 @@ public final class Socket: NSObject, IWebsocketHandler {
         ]
         guard let sseURL = components.url else { throw ARTError.invalidPath("Bad SSE URL") }
         
-        LogTracer.log("[ART] SSE URL: \(sseURL)")
         sseTask = Task { [weak self] in
             guard let self else { return }
             
@@ -246,7 +241,6 @@ public final class Socket: NSObject, IWebsocketHandler {
                 }
                 
             } catch {
-                LogTracer.log("[ART] SSE error: \(error)")
             }
         }
     }
@@ -265,7 +259,6 @@ public final class Socket: NSObject, IWebsocketHandler {
             projectKey:   credentials.projectKey
         )
         
-        LogTracer.log("[ART] Live connection opened \(connection?.connectionId ?? "")")
         emitter.emit("connection", connection!)
         isConnectionActive = true
         startHeartbeat()
@@ -380,7 +373,6 @@ public final class Socket: NSObject, IWebsocketHandler {
                 websocketHandler: self, process: "subscribe"
             )
         }
-        LogTracer.log("[ART] Subscription created: \(channel)")
         let buf = withSocketLock { () -> [(event: String, payload: [String: Any])]? in
             subscriptions[channel] = subscription
             return pendingIncomingMessages.removeValue(forKey: channel)
@@ -389,7 +381,6 @@ public final class Socket: NSObject, IWebsocketHandler {
         // Replay buffered messages
         if let buf = buf {
             for item in buf {
-                LogTracer.log("[ART] Replaying buffered message for \(channel)")
                 await subscription.handleMessage(event: item.event, payload: item.payload)
             }
         }
@@ -446,7 +437,6 @@ public final class Socket: NSObject, IWebsocketHandler {
     
     private func handleIncomingMessage(_ parsed: [String: Any]) {
         guard let channel = parsed["channel"] as? String else {
-            LogTracer.log("[ART] Message missing channel")
             return
         }
         
@@ -480,7 +470,6 @@ public final class Socket: NSObject, IWebsocketHandler {
         }
         
         if channel.isEmpty || (event.isEmpty && returnFlag != "SA") {
-            LogTracer.log("[ART] Message without channel or event")
             return
         }
         
@@ -497,7 +486,6 @@ public final class Socket: NSObject, IWebsocketHandler {
             if let interception = interception {
                 Task { await interception.handleMessage(channel: channel, data: payload) }
             } else {
-                LogTracer.log("[ART] No interception for: \(iName)")
             }
             return
         }
@@ -512,7 +500,6 @@ public final class Socket: NSObject, IWebsocketHandler {
             Task { await sub.handleMessage(event: event, payload: payload) }
         } else {
             withSocketLock { pendingIncomingMessages[subKey, default: []].append((event: event, payload: payload)) }
-            LogTracer.log("[ART] No subscription for \(subKey) – buffering")
         }
     }
     
@@ -520,7 +507,6 @@ public final class Socket: NSObject, IWebsocketHandler {
     // MARK: - HTTP poll switch
     private func switchToHttpPoll() {
         guard pullSource != "http" else { return }
-        LogTracer.log("[ART] Shifting to HTTP poll")
         pullSource = "http"; pushSource = "http"
         lpClient.start(connectionId: connection?.connectionId ?? "")
     }
@@ -528,15 +514,9 @@ public final class Socket: NSObject, IWebsocketHandler {
     // MARK: - IWebsocketHandler: sendMessage
     @discardableResult
     public func sendMessage(_ message: String) -> Bool {
-        
-        LogTracer.printJSONString(
-              message,
-              title: "Outgoing Socket Data"
-            )
  
         guard let task = websocket, task.state == .running else {
             withSocketLock { pendingSendMessages.append(message) }
-            LogTracer.log("[ART] WebSocket not open – message buffered")
             return false
         }
         task.send(.string(message)) { [weak self] error in
@@ -631,10 +611,6 @@ public final class Socket: NSObject, IWebsocketHandler {
                     let msg = try await task.receive()
                     switch msg {
                     case .string(let s):
-                        LogTracer.printJSONString(
-                            s,
-                                    title: "Raw incoming socket message"
-                                  );
                         parseIncomingMessage(s)
                     case .data(let d):
                         if let s = String(data: d, encoding: .utf8) { parseIncomingMessage(s) }
@@ -681,9 +657,7 @@ extension Socket: URLSessionWebSocketDelegate {
         isConnecting = false
         
         let reasonStr = reason.flatMap { String(data: $0, encoding: .utf8) }
-        
-        LogTracer.log("[ART] WS closed: \(closeCode) \(reasonStr ?? "")")
-        
+
         emitter.emit("close", closeCode)
     }
 }

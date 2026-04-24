@@ -29,7 +29,6 @@ public final class Interception {
     }
 
     public func reconnect() {
-        LogTracer.log("[ART] reconnecting interceptor \(interceptorName)")
         Task { try? await validateInterception() }
     }
     
@@ -80,7 +79,6 @@ public final class Interception {
         let resolve: (Any) -> Void = { [weak self] data in
             guard let self else { return }
             guard let dataDict = data as? [String: Any] ?? (data as? [[String: Any]]).map({ ["items": $0] }) else {
-                LogTracer.log("[ART] Interception resolve: invalid data (must be JSON object)")
                 return
             }
             var sanitized = dataDict

@@ -64,8 +64,7 @@ public final class LiveObjSubscription: BaseSubscription {
             do {
                 try await self?.pushArray(event: "merge", data: serializedOps)
             } catch {
-                LogTracer.log("[ART] CRDT merge push failed: \(error)")
-            }
+return            }
         }
     }
 
@@ -116,7 +115,6 @@ public final class LiveObjSubscription: BaseSubscription {
         }
 
         guard let opsDict = rawOps else {
-            LogTracer.log("[ART] Failed to parse CRDT ops")
             return
         }
 

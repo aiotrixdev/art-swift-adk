@@ -107,7 +107,6 @@ public final class Subscription: BaseSubscription {
                 }
 
             } catch {
-                LogTracer.log("[ART] Decryption error: \(error)")
                 return
             }
         }
