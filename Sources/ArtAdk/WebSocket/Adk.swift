@@ -254,7 +254,7 @@ open class Adk {
         req.setValue(creds.projectKey,           forHTTPHeaderField: "ProjectKey")
         req.httpBody = try JSONSerialization.data(withJSONObject: ["public_key": keyPair.publicKey])
 
-        let (data, response) = try await URLSession.shared.data(for: req)
+        let (_, response) = try await URLSession.shared.data(for: req)
         guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
             throw ARTError.serverError("Error updating keypair")
         }

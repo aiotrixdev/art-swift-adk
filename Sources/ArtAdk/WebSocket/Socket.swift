@@ -656,7 +656,7 @@ extension Socket: URLSessionWebSocketDelegate {
         isConnectionActive = false
         isConnecting = false
         
-        let reasonStr = reason.flatMap { String(data: $0, encoding: .utf8) }
+        let _ = reason.flatMap { String(data: $0, encoding: .utf8) }
 
         emitter.emit("close", closeCode)
     }
