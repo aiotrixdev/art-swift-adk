@@ -1,183 +1,307 @@
-# ARTSdk – Swift
+[![Version](https://img.shields.io/badge/version-1.0.0-blue.svg)]
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)]
+[![Platform](https://img.shields.io/badge/platform-iOS%20%7C%20macOS-blue.svg)]
 
-A complete Swift port of the ART ADK TypeScript SDK.  
-Targets **iOS 16+ / macOS 13+**.  
-Uses [TweetNaclSwift](https://github.com/bitmark-inc/tweetnacl-swiftwrap) for NaCl box encryption.
+Swift SDK for **[ART — A Realtime Tech communication,](https://arealtimetech.com/)**, a realtime messaging platform providing WebSocket-based channels, presence tracking, end-to-end encrypted messaging, and CRDT-backed shared objects.
 
----
 
-## Installation (Swift Package Manager)
+## Features
+
+* **WebSocket connection management** — connect, pause, resume, and auto-reconnect
+* **Channel subscriptions** — default, targeted, group, secure (encrypted), and CRDT channels
+* **Push messages** — send structured payloads with optional per-user targeting
+* **Event listening** — receive messages via `emitter.on()`
+* **Presence tracking** — observe users online in real time
+* **End-to-end encryption** — automatic encryption on secure channels
+* **Interceptors** — intercept and modify messages
+* **Shared objects (CRDT)** — real-time collaborative state
+
+
+## Installation
+
+### Swift Package Manager
 
 ```swift
-// Package.swift
 dependencies: [
-    .package(url: "https://github.com/<your-org>/ADK.git", from: "1.0.0"),
+    .package(url: "https://github.com/<your-org>/art-swift-adk.git", from: "1.0.0")
 ]
 ```
 
-Or add via Xcode → File → Add Packages.
+Or in Xcode:
 
----
+**File → Add Packages → Paste repository URL**
+
+
+## Configuration
+
+### 1. Create credentials
+
+Store your ART credentials securely:
+
+```swift
+let creds = CredentialStore(
+    environment:  "YOUR_ENV",
+    projectKey:   "YOUR_PROJECT_KEY",
+    orgTitle:     "YOUR_ORG",
+    clientID:     "CLIENT_ID",
+    clientSecret: "CLIENT_SECRET"
+)
+```
+
+
+### 2. Get a user passcode
+
+ART uses a short-lived passcode for authentication:
+
+```swift
+func fetchPasscode(creds: CredentialStore) async throws -> String {
+    let url = URL(string: "https://dev.arealtimetech.com/ws/v1/connect/passcode")!
+    
+    var request = URLRequest(url: url)
+    request.httpMethod = "POST"
+    
+    request.addValue(creds.clientID, forHTTPHeaderField: "Client-Id")
+    request.addValue(creds.clientSecret, forHTTPHeaderField: "Client-Secret")
+    request.addValue(creds.orgTitle, forHTTPHeaderField: "X-Org")
+    request.addValue(creds.environment, forHTTPHeaderField: "Environment")
+    request.addValue(creds.projectKey, forHTTPHeaderField: "ProjectKey")
+    request.addValue("application/json", forHTTPHeaderField: "Content-Type")
+    
+    let body: [String: Any] = [
+        "username": "john_doe",
+        "first_name": "John",
+        "last_name": "Doe"
+    ]
+    
+    request.httpBody = try JSONSerialization.data(withJSONObject: body)
+    
+    let (data, _) = try await URLSession.shared.data(for: request)
+    let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+    let dataObj = json?["data"] as? [String: Any]
+    
+    return dataObj?["passcode"] as? String ?? ""
+}
+```
 
 ## Quick Start
 
 ```swift
 import ARTSdk
 
-// 1. Create Adk instance
-let adk = Adk(config: AdkConfig(uri: "your-server.com"))
+let passcode = try await fetchPasscode(creds: creds)
 
-// 2. Listen for connection
+let adk = Adk(config: AdkConfig(
+    uri: "ws.arealtimetech.com",
+    authToken: passcode,
+    getCredentials: { creds }
+))
+
 adk.on("connection") { data in
     if let conn = data as? ConnectionDetail {
-        print("Connected: \(conn.connectionId)")
+        print("Connected → \(conn.connectionId)")
     }
 }
 
-// 3. Connect
-await adk.connect()
-
-// 4. Subscribe to a channel
-let sub = try await adk.subscribe(channel: "my-channel")
-if let subscription = sub as? Subscription {
-    subscription.bind(event: "my-event") { data in
-        print("Received: \(data)")
-    }
+adk.on("close") { reason in
+    print("Closed:", reason)
 }
-```
 
----
+try await adk.connect()
 
-## Auth – credentials
+let sub = try await adk.subscribe(channel: "room-42")
 
-```swift
-// Static credentials
-let config = AdkConfig(
-    uri: "your-server.com",
-    getCredentials: {
-        CredentialStore(
-            environment:  "production",
-            projectKey:   "my-project",
-            orgTitle:     "my-org",
-            clientID:     "abc",
-            clientSecret: "secret"
-        )
-    }
+sub.emitter.on("message") { data in
+    print("Received:", data)
+}
+
+try await sub.push(
+    event: "message",
+    data: ["text": "Hello ART!"]
 )
 ```
 
----
-
-## LiveObject (CRDT) Channel
+## Connecting
 
 ```swift
-let sub = try await adk.subscribe(channel: "shared-data-channel")
-guard let liveObj = sub as? LiveObjSubscription else { return }
+try await adk.connect()
+```
 
-// Read via @dynamicMemberLookup proxy
-let state = liveObj.state()
-let name = state.user.name.value as? String
+Safe usage:
 
-// Write
-state.user.name.set("Alice")
-state.scores.push(42)
-
-// Query with listener
-let handle = liveObj.query(path: "user.name")
-_ = await handle.listen { newValue in
-    print("Name changed: \(newValue)")
+```swift
+do {
+    try await adk.connect()
+} finally {
+    await adk.disconnect()
 }
 ```
 
----
+Check state:
+
+```swift
+adk.getState() // connected | retrying | paused | stopped
+```
+
+## Subscribing to a Channel
+
+```swift
+let sub = try await adk.subscribe(channel: "room-42")
+
+if let live = sub as? LiveObjSubscription {
+    // CRDT channel
+}
+```
+
+Unsubscribe:
+
+```swift
+await sub.unsubscribe()
+```
+
+
+## Pushing Messages
+
+```swift
+try await sub.push(
+    event: "message",
+    data: ["text": "Hello"]
+)
+```
+
+Targeted messaging:
+
+```swift
+try await sub.push(
+    event: "message",
+    data: ["text": "Hi Bob"],
+    options: PushConfig(to: ["bob"])
+)
+```
+
+## Receiving Messages
+
+```swift
+sub.emitter.on("message") { data in
+    print("Got:", data)
+}
+```
 
 ## Presence
 
 ```swift
-let unsubscribe = try await subscription.fetchPresence(callback: { users in
-    print("Online users: \(users)")
-}, options: .init(unique: true))
+let cancel = try await sub.fetchPresence { users in
+    print("Online:", users)
+}
 
-// Later:
-await unsubscribe()
+// later
+await cancel()
 ```
 
----
-
-## Secure Channel (E2E Encryption)
+## Encrypted Channels
 
 ```swift
-// Generate and register a key pair once
-let keyPair = try adk.generateKeyPair()
-try await adk.setKeyPair(keyPair)
+try await adk.generateKeyPair()
 
-// Then subscribe/push to a channel of type "secure" – encryption/decryption is automatic
+let secure = try await adk.subscribe(channel: "SECURE_CHANNEL")
+
+try await secure.push(
+    event: "message",
+    data: ["text": "Private"],
+    options: PushConfig(to: ["bob"])
+)
+
+secure.emitter.on("message") { data in
+    print("Decrypted:", data)
+}
 ```
 
----
+## Shared Object Channels (CRDT)
+
+```swift
+let sub = try await adk.subscribe(channel: "CRDT_CHANNEL")
+
+if let live = sub as? LiveObjSubscription {
+    
+    // Write
+    live.state()["document"]["title"].set("My Doc")
+    await live.flush()
+    
+    // Read
+    let snapshot = await live.query(path: "document").execute()
+    print(snapshot)
+    
+    // Listen
+    let dispose = await live.query(path: "document").listen { data in
+        print("Updated:", data)
+    }
+    
+    dispose()
+}
+```
+
+### Array Operations
+
+```swift
+let items = live.state()["items"]
+
+items.push("alpha")
+items.unshift("zero")
+items.pop()
+items.removeAt(2)
+items.splice(start: 1, deleteCount: 1, insert: ["x"])
+
+await live.flush()
+```
 
 ## Interceptors
 
 ```swift
-let interception = try await adk.intercept(interceptor: "my-interceptor") { payload, resolve, reject in
-    // Inspect / modify / allow or block the message
-    var modified = payload
-    modified["processed"] = true
-    resolve(modified)
+try await adk.intercept(interceptor: "filter") { payload, resolve, reject in
+    
+    if let text = payload["text"] as? String,
+       text.contains("anyword") {
+        reject("Blocked")
+        return
+    }
+    
+    resolve(payload)
 }
 ```
 
----
 
-## REST API helper
-
-```swift
-let result: [String: Any] = try await adk.call(
-    endpoint: "/v1/some-endpoint",
-    options: CallApiProps(method: "POST", payload: ["key": "value"])
-)
-```
-
----
-
-## Connection lifecycle
+## Connection Lifecycle
 
 ```swift
-adk.pause()              // suspend, stops reconnection
-await adk.resume()       // resume
-await adk.disconnect()   // full teardown
-print(adk.getState())    // "connected" | "paused" | "retrying" | "stopped"
+adk.on("connection") { data in
+    print("Connected")
+}
+
+adk.on("close") { _ in
+    print("Closed")
+}
+
+adk.pause()
+await adk.resume()
+await adk.disconnect()
 ```
 
----
+## Documentation
 
-## File structure
+Full documentation is available at **[docs.arealtimetech.com/docs/adk](https://docs.arealtimetech.com/docs/adk/)**.
 
-```
-Sources/ARTSdk/
-├── Config/
-│   └── Constant.swift          // URL configuration
-├── Types/
-│   ├── AuthTypes.swift          // AdkConfig, CredentialStore, AuthData …
-│   ├── ChannelTypes.swift       // ChannelConfig
-│   ├── SocketTypes.swift        // ConnectionDetail, PushConfig, IWebsocketHandler …
-│   └── CryptoTypes.swift        // KeyPairType
-├── Auth/
-│   └── Auth.swift               // Singleton auth, JWT decode, token refresh
-├── Crypto/
-│   └── CryptoBox.swift          // NaCl box encrypt/decrypt via TweetNacl
-├── CRDT/
-│   ├── CRDTTypes.swift          // LDValue, LDEntry, LDMap, LDArray, CRDTOperation
-│   ├── CRDTUtils.swift          // generateId, toLDValue, linearizeRGA, ARTError
-│   └── CRDT.swift               // CRDT engine + @dynamicMemberLookup CRDTProxy
-└── WebSocket/
-    ├── EventEmitter.swift        // Lightweight EventEmitter
-    ├── HelperFunctions.swift     // subscribe_to_channel, unsubscribe, get_interceptor_config
-    ├── LongPollClient.swift      // HTTP long-poll fallback
-    ├── BaseSubscription.swift    // Base class (ack, presence, push, buffer)
-    ├── Subscription.swift        // Standard pub/sub channel
-    ├── LiveObjSubscription.swift // CRDT shared-object channel
-    ├── Interception.swift        // Interceptor handler
-    ├── Socket.swift              // Core socket (WS → SSE → LongPoll, heartbeat)
-    └── Adk.swift                 // Public entry point (mirrors adk.ts exactly)
-```
+| Topic | Link |
+|---|---|
+| Overview | [ADK Overview](https://docs.arealtimetech.com/docs/adk/) |
+| Installation | [Flutter Installation](https://docs.arealtimetech.com/docs/adk/flutter/installation) |
+| Publish & Subscribe | [Pub/Sub Docs](https://docs.arealtimetech.com/docs/adk/flutter/pub-sub) |
+| Connection Management | [Connection Docs](https://docs.arealtimetech.com/docs/adk/flutter/connection-management) |
+| User Presence | [Presence Docs](https://docs.arealtimetech.com/docs/adk/flutter/user-presence) |
+| Encrypted Channels | [Encryption Docs](https://docs.arealtimetech.com/docs/adk/flutter/encrypted-channel) |
+| Shared Object Channels | [Shared Object Docs](https://docs.arealtimetech.com/docs/adk/flutter/shared-object-channel) |
+| Interceptors | [Interceptor Docs](https://docs.arealtimetech.com/docs/adk/flutter/intercept-channel) |
+
+
+## License
+
+Released under the [MIT License](LICENSE).
+
