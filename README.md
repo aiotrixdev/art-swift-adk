@@ -1,6 +1,4 @@
-[![Version](https://img.shields.io/badge/version-1.0.0-blue.svg)]
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)]
-[![Platform](https://img.shields.io/badge/platform-iOS%20%7C%20macOS-blue.svg)]
+# ART Swift SDK
 
 Swift SDK for **[ART — A Realtime Tech communication,](https://arealtimetech.com/)**, a realtime messaging platform providing WebSocket-based channels, presence tracking, end-to-end encrypted messaging, and CRDT-backed shared objects.
 
