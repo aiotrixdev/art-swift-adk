@@ -23,7 +23,7 @@ Swift SDK for **[ART — A Realtime Tech communication,](https://arealtimetech.c
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/<your-org>/art-swift-adk.git", from: "1.0.0")
+    .package(url: "https://github.com/aiotrixdev/art-swift-adk.git", from: "1.0.0")
 ]
 ```
 

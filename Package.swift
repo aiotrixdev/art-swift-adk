@@ -23,6 +23,7 @@ let package = Package(
                 .product(name: "TweetNacl", package: "tweetnacl-swiftwrap")
             ]
         ),
-    ]
+    ],
+    swiftLanguageVersions: [.v5]
 
 )
