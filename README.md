@@ -2,7 +2,6 @@
 
 Swift SDK for **[ART — A Realtime Tech communication,](https://arealtimetech.com/)**, a realtime messaging platform providing WebSocket-based channels, presence tracking, end-to-end encrypted messaging, and CRDT-backed shared objects.
 
-
 ## Features
 
 * **WebSocket connection management** — connect, pause, resume, and auto-reconnect
