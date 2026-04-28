@@ -1,14 +1,14 @@
 // swift-tools-version: 5.9
 import PackageDescription
-
+//Swift SDK for **[ART — A Realtime Tech communication,](https://arealtimetech.com/)**, a realtime messaging platform providing WebSocket-based channels, presence tracking, end-to-end encrypted messaging, and CRDT-backed shared objects.
 let package = Package(
-    name: "ADK",
+    name: "ArtAdk",
     platforms: [
-        .iOS(.v16),
+        .iOS(.v15),
         .macOS(.v13)
     ],
     products: [
-        .library(name: "ADK", targets: ["ADK"]),
+        .library(name: "ArtAdk", targets: ["ArtAdk"]),
     ],
     dependencies: [
         .package(
@@ -18,11 +18,12 @@ let package = Package(
     ],
     targets: [
         .target(
-            name: "ADK",
+            name: "ArtAdk",
             dependencies: [
                 .product(name: "TweetNacl", package: "tweetnacl-swiftwrap")
             ]
         ),
-    ]
+    ],
+    swiftLanguageVersions: [.v5]
 
 )
