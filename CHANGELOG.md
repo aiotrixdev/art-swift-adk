@@ -1,8 +1,10 @@
+# Changelog
 
-## 1.0.0 — 
+All notable changes to this project will be documented in this file.
 
-###  Initial Version
+## [1.0.0] - 2026-04-28
 
+### Initial Version
 - Initial release of ART ADK
 - WebSocket connection management
 - Channel subscription (broadcast, targeted, group, encrypted, shared)
