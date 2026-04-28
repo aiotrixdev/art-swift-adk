@@ -14,3 +14,5 @@ All notable changes to this project will be documented in this file.
 - Encrypted channel support
 - Interceptors for message processing
 - CRDT-based shared object channels
+
+[1.0.0]: https://github.com/aiotrixdev/art-swift-adk/releases/tag/1.0.0
