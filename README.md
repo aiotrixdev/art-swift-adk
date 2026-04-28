@@ -1,18 +1,25 @@
-# ART Swift SDK
+# ART Swift ADK
 
-Swift SDK for **[ART — A Realtime Tech communication,](https://arealtimetech.com/)**, a realtime messaging platform providing WebSocket-based channels, presence tracking, end-to-end encrypted messaging, and CRDT-backed shared objects.
+![Swift](https://img.shields.io/badge/Swift-5.9-orange)
+![Platform](https://img.shields.io/badge/iOS-15%2B-blue)
+![License](https://img.shields.io/badge/license-MIT-green)
+
+Swift SDK for **[ART – A Realtime Tech Communication](https://arealtimetech.com/)**, a realtime messaging platform providing WebSocket-based channels, presence tracking, end-to-end encrypted messaging, and CRDT-backed shared objects.
+
+---
 
 ## Features
 
-* **WebSocket connection management** — connect, pause, resume, and auto-reconnect
-* **Channel subscriptions** — default, targeted, group, secure (encrypted), and CRDT channels
-* **Push messages** — send structured payloads with optional per-user targeting
-* **Event listening** — receive messages via `emitter.on()`
-* **Presence tracking** — observe users online in real time
-* **End-to-end encryption** — automatic encryption on secure channels
-* **Interceptors** — intercept and modify messages
-* **Shared objects (CRDT)** — real-time collaborative state
+- WebSocket connection management (connect, pause, resume, auto-reconnect)
+- Channel subscriptions (default, targeted, group, encrypted, CRDT)
+- Push messages with structured payloads
+- Event-based message listening (`emitter.on`)
+- Real-time presence tracking
+- End-to-end encryption support
+- Interceptors for message processing
+- Shared objects using CRDT
 
+---
 
 ## Installation
 
@@ -284,7 +291,8 @@ await adk.disconnect()
 
 ## Documentation
 
-Full documentation is available at **[docs.arealtimetech.com/docs/adk](https://docs.arealtimetech.com/docs/adk/)**.
+Full documentation is available at:
+https://docs.arealtimetech.com/docs/adk/
 
 | Topic | Link |
 |---|---|
@@ -300,5 +308,5 @@ Full documentation is available at **[docs.arealtimetech.com/docs/adk](https://d
 
 ## License
 
-Released under the [MIT License](LICENSE).
+Released under the [MIT License](https://github.com/aiotrixdev/art-swift-adk/blob/main/LICENSE).
 
