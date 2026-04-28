@@ -1,4 +1,4 @@
-// Sources/ARTSdk/WebSocket/Adk.swift
+// Sources/ArtAdk/WebSocket/Adk.swift
 
 import Foundation
 

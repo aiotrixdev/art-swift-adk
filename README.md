@@ -84,7 +84,7 @@ func fetchPasscode(creds: CredentialStore) async throws -> String {
 ## Quick Start
 
 ```swift
-import ARTSdk
+import ArtAdk
 
 let passcode = try await fetchPasscode(creds: creds)
 

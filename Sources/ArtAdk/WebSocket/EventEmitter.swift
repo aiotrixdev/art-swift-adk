@@ -1,4 +1,4 @@
-// Sources/ARTSdk/WebSocket/EventEmitter.swift
+// Sources/ArtAdk/WebSocket/EventEmitter.swift
 
 import Foundation
 
