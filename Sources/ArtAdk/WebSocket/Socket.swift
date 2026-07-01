@@ -112,20 +112,30 @@ public final class Socket: NSObject, IWebsocketHandler {
             pullSource = "socket"; pushSource = "socket"
             return
         } catch {
-            return
+            // WebSocket failed — fall through to the next transport.
+            // (Previously this `catch` returned, which left the SSE and
+            // long-poll tiers below as dead code and disabled the
+            // transport fallback entirely. Mirrors the Flutter
+            // `initiateSocket` fall-through.)
         }
-        
+
         // 2. SSE
         do {
             try await connectSSE()
             pullSource = "sse"; pushSource = "http"
             return
         } catch {
+            // SSE failed — fall through to long-poll.
         }
-        
+
         // 3. LongPoll
         pullSource = "http"; pushSource = "http"
         lpClient.start(connectionId: connection?.connectionId)
+        // Long-poll has no `art_ready` handshake to bind a connection, so
+        // synthesize one — otherwise `wait()` never resolves and `push()`
+        // throws `.notConnected` in poll mode. Mirrors the Flutter
+        // `_openLocalFallbackConnection()` call in `initiateSocket`.
+        openLocalFallbackConnection()
     }
     
     
@@ -245,6 +255,31 @@ public final class Socket: NSObject, IWebsocketHandler {
         }
     }
     
+    // MARK: - Local fallback connection (long-poll bootstrap)
+    /// Synthesizes a local `ConnectionDetail` so the SDK is usable over
+    /// long-poll, where there is no WebSocket `art_ready` handshake to bind
+    /// a connection. Without this, `wait()` never resolves and `push()`
+    /// throws `.notConnected` once the transport falls back to polling.
+    ///
+    /// Idempotent: a no-op once a real (or prior local) connection is
+    /// active. If a later `art_ready` arrives, `handleConnectionBinding`
+    /// upgrades the connection to the server-issued id. Mirrors the Flutter
+    /// `_openLocalFallbackConnection()`.
+    private func openLocalFallbackConnection() {
+        if isConnectionActive && connection != nil { return }
+        connection = ConnectionDetail(
+            connectionId: "local_\(Int(Date().timeIntervalSince1970 * 1000))",
+            instanceId:   "instance_local",
+            tenantName:   credentials.orgTitle,
+            environment:  credentials.environment,
+            projectKey:   credentials.projectKey
+        )
+        isConnectionActive = true
+        emitter.emit("connection", connection!)
+        resolveWaiters()
+        startHeartbeat()
+    }
+
     // MARK: - Connection binding  (art_ready / ready)
     private func handleConnectionBinding(_ rawData: String) {
         setAutoReconnect(true)
