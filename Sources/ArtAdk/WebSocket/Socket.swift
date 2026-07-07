@@ -9,6 +9,9 @@ public struct WebSocketEvents {
     public var onError:      ((Error) -> Void)?
     public var onClose:      ((URLSessionWebSocketTask.CloseCode, String?) -> Void)?
     public var onConnection: ((ConnectionDetail) -> Void)?
+    /// Fired when the server rejects the connection for a billing / concurrency
+    /// limit (`CONNECTION_MINUTES_LIMIT_EXCEEDED` / `CONCURRENT_LIMIT_EXCEEDED`).
+    public var onLimitExceeded: ((_ code: String, _ error: String) -> Void)?
 }
 
 // MARK: - Socket (singleton)
@@ -471,10 +474,11 @@ public final class Socket: NSObject, IWebsocketHandler {
     
     
     private func handleIncomingMessage(_ parsed: [String: Any]) {
-        guard let channel = parsed["channel"] as? String else {
-            return
-        }
-        
+        // A channel-less frame is normally dropped by the empty-channel guard
+        // below; the limit block further down must inspect it first for a
+        // billing / concurrency rejection, so extract non-optionally here.
+        let channel      = parsed["channel"]         as? String ?? ""
+
         let event        = parsed["event"]           as? String ?? ""
         let refId        = parsed["ref_id"]          as? String ?? ""
         let returnFlag   = parsed["return_flag"]     as? String ?? ""
@@ -504,6 +508,23 @@ public final class Socket: NSObject, IWebsocketHandler {
             return
         }
         
+        // Limit block — a billing / concurrency-limit rejection arrives with no
+        // channel, carrying only `code` + `error`. Surface it as `limitExceeded`
+        // so the Adk layer can permanently stop reconnecting, then drop the
+        // frame. Mirrors js-adk-common socket.ts.
+        if channel.isEmpty {
+            let code = parsed["code"] as? String ?? ""
+            if code == "CONNECTION_MINUTES_LIMIT_EXCEEDED" || code == "CONCURRENT_LIMIT_EXCEEDED" {
+                let errText = parsed["error"] as? String ?? ""
+                let label = code == "CONCURRENT_LIMIT_EXCEEDED"
+                    ? "Concurrent connection limit reached"
+                    : "Connection minutes limit exceeded"
+                print("[ART] \(label). Reconnection blocked.")
+                emitter.emit("limitExceeded", ["code": code, "error": errText])
+                return
+            }
+        }
+
         if channel.isEmpty || (event.isEmpty && returnFlag != "SA") {
             return
         }

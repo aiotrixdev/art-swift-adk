@@ -18,6 +18,10 @@ open class Adk {
     private var adkConfig: AdkConfig?
     private var isPaused: Bool = false
     private var isConnectable: Bool = false
+    /// Set once the server reports a billing / concurrency limit. Latches
+    /// auto-reconnection off permanently — `handleOnClose` / `handleReconnection`
+    /// early-return while this is true. Mirrors js-adk-common `adk.ts`.
+    private var isLimitExceeded: Bool = false
     private var reconnectTask: Task<Void, Never>?
     public private(set) var state: AdkState = .stopped
 
@@ -71,6 +75,19 @@ open class Adk {
 
         _ = socket.on("close") { [weak self] _ in
             self?.handleOnClose()
+        }
+
+        _ = socket.on("limitExceeded") { [weak self] data in
+            guard let self else { return }
+            let info = data as? [String: String]
+            let code = info?["code"] ?? ""
+            let errText = info?["error"] ?? ""
+            let msg = code == "CONCURRENT_LIMIT_EXCEEDED"
+                ? "[ART] Concurrent connection limit reached: \(errText). All reconnection attempts stopped. Call connect() again to retry."
+                : "[ART] Billing limit reached: \(errText). All reconnection attempts permanently stopped."
+            print(msg)
+            self.isLimitExceeded = true
+            self.isConnectable = false
         }
     }
 
@@ -180,12 +197,14 @@ open class Adk {
     }
 
     private func handleOnClose() {
+        if isLimitExceeded { return }   // billing / concurrency limit — never auto-reconnect
         guard isConnectable else { return }
         socket.isReConnecting = true
         handleReconnection()
     }
 
     private func handleReconnection() {
+        if isLimitExceeded { return }   // billing / concurrency limit — never auto-reconnect
         reconnectTask?.cancel()
         reconnectTask = Task { [weak self] in
             guard let self else { return }
