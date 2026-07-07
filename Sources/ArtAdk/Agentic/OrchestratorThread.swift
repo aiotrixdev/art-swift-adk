@@ -77,6 +77,17 @@ public final class OrchestratorThread {
         attachedEvents.insert(event)
     }
 
+    /// Subscribes `callback` to inbound `trace` diagnostic / telemetry frames
+    /// on this thread. Binds both the channel-level and thread-scoped `trace`
+    /// event so a frame is delivered whether or not it carries a `thread_id`.
+    /// Mirrors js-adk-common `OrchestratorThread.listenTrace`.
+    public func listenTrace(_ callback: @escaping (Any) -> Void) {
+        guard !disposed else { return }
+        subscription.bind(event: "trace", callback: callback)
+        subscription.attachThreadBind(threadId, "trace", callback)
+        attachedEvents.insert("trace")
+    }
+
     /// Removes every listener bound to `event` on this thread.
     public func remove(event: String) {
         guard !disposed else { return }
@@ -89,8 +100,14 @@ public final class OrchestratorThread {
     public func dispose() {
         guard !disposed else { return }
         disposed = true
+        let hadTrace = attachedEvents.contains("trace")
         for event in attachedEvents {
             subscription.detachThreadListener(threadId, event)
+        }
+        // `listenTrace` also binds a channel-level `trace` listener; the loop
+        // above only detaches the thread-scoped one, so clear it too.
+        if hadTrace {
+            subscription.remove(event: "trace")
         }
         attachedEvents.removeAll()
         subscription.unregisterThread(threadId)

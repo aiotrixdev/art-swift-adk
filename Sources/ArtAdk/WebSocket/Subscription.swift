@@ -285,6 +285,18 @@ public final class Subscription: BaseSubscription {
         }
 
         // -------------------------------------------------------
+        // TRACE (diagnostic / telemetry) FRAMES
+        // -------------------------------------------------------
+        // Emitted directly to their listeners, bypassing the subscribed-state
+        // gate + the normal buffering path (mirrors js-adk-common
+        // subscription.ts). Consumers attach via `AgentThread.listenTrace` /
+        // `OrchestratorThread.listenTrace`.
+        if event == "trace" {
+            emitThreadEvent("trace", content, mutablePayload["thread_id"] as? String)
+            return
+        }
+
+        // -------------------------------------------------------
         // EMIT TO LISTENERS (thread-aware)
         // -------------------------------------------------------
         guard isSubscribed else { return }

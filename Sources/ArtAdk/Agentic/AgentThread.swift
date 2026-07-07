@@ -53,6 +53,16 @@ public final class AgentThread {
         userListeners.append(callback)
     }
 
+    /// Subscribes `callback` to inbound `trace` diagnostic / telemetry frames
+    /// (heartbeats, checkpoints, deadlock signals) on this thread. Each frame
+    /// is delivered as its raw value. Mirrors js-adk-common
+    /// `AgentThread.listenTrace`.
+    public func listenTrace(_ callback: @escaping (Any) -> Void) async {
+        guard let sub = try? await agent.getSubscription() else { return }
+        sub.bind(event: "trace", callback: callback)
+        sub.attachThreadBind(threadId, "trace", callback)
+    }
+
     /// Registers a handler invoked whenever a `HumanInputRequest` arrives
     /// for the currently active `Run`.
     public func feedbackRequest(_ handler: @escaping AgentHumanInputHandler) {
