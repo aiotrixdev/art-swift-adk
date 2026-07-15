@@ -21,7 +21,6 @@ import Foundation
 /// await thread.listen { event in print("event: \(event.event)") }
 /// let run = try await thread.run("plan my trip")
 /// let output = try await run.done()
-/// print(output.message)
 /// ```
 public final class Agent: BaseWorkflow {
 
