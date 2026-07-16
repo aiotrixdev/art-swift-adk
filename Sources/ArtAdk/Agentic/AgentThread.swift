@@ -33,9 +33,9 @@ public final class AgentThread {
     private var activeRun: Run?
 
     /// Created via `Agent.thread()`; not for direct instantiation.
-    init(agent: Agent) {
+    init(agent: Agent,threadId: String? = nil) {
         self.agent = agent
-        self.threadId = AgentThread.generateThreadId()
+        self.threadId = threadId ?? AgentThread.generateThreadId()
     }
 
     private static func generateThreadId() -> String {

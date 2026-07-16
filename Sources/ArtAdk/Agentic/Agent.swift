@@ -36,11 +36,14 @@ public final class Agent: BaseWorkflow {
 
     public override var channelName: String { "agent_com_\(agentId)" }
 
-    /// Returns a new `AgentThread` backed by this agent.
-    ///
-    /// Each call returns a fresh thread with its own thread id; the same
-    /// agent may host many concurrent threads.
-    public func thread() -> AgentThread {
-        AgentThread(agent: self)
-    }
+    /// Creates or reconnects to an agent thread.
+       ///
+       /// - Parameter threadId:
+       ///   Existing thread identifier. If `nil`, a new thread will be
+       ///   created by the server.
+       ///
+       /// - Returns: An `AgentThread` instance.
+       public func thread(_ threadId: String? = nil) -> AgentThread {
+           AgentThread(agent: self, threadId: threadId)
+       }
 }
