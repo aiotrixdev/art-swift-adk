@@ -256,11 +256,15 @@ return
     
     
     // MARK: - Push
+    /// Sends an event on this channel. Returns the SDK-generated `ref_id`
+    /// (or `nil` for control channels that are not ref-tracked) so callers
+    /// such as `AgentThread.run` can correlate the originating message.
+    @discardableResult
     public func push(
         event: String,
         data: [String: Any],
         options: PushConfig? = nil
-    ) async throws {
+    ) async throws -> String? {
 
         await websocketHandler.wait()
 
@@ -323,11 +327,18 @@ return
             message["ref_id"] = refId
         }
 
+        // Thread-scoped pushes (OrchestratorThread) carry the thread id at
+        // the top level so the server and thread listeners can correlate.
+        if let threadID = options?.threadID, !threadID.isEmpty {
+            message["thread_id"] = threadID
+        }
 
         if let msgData = try? JSONSerialization.data(withJSONObject: message),
            let msgStr = String(data: msgData, encoding: .utf8) {
             _ = websocketHandler.sendMessage(msgStr)
         }
+
+        return refId
     }
 
     public func pushArray(event: String, data: [[String: Any]]) async throws {
