@@ -120,13 +120,23 @@ public final class Auth {
             }
         }
         
-        let headers: [String: String] = [
-            "Client-Id":   credentials.clientID,
+        var headers: [String: String] = [
             "X-Org":       credentials.orgTitle,
             "Environment": credentials.environment,
             "ProjectKey":  credentials.projectKey,
         ]
-        
+        // Conditional Client-Id + passcode/access-token headers on the refresh
+        // path. Mirrors js-adk-common auth.ts refresh (ea09149).
+        if !credentials.clientID.isEmpty {
+            headers["Client-Id"] = credentials.clientID
+        }
+        if let token = credentials.accessToken, !token.isEmpty {
+            headers["T-pass"] = token
+        }
+        if let authToken = credentials.config?.authToken {
+            headers["X-pass"] = authToken
+        }
+
         guard let url = URL(string: "\(Constant.BASE_URL)/auth/token/refresh") else {
             throw ARTError.authenticationFailed("Malformed auth refresh URL")
         }

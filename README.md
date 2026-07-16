@@ -4,7 +4,8 @@
 ![Platform](https://img.shields.io/badge/iOS-15%2B-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
-Swift SDK for **[ART – A Realtime Tech Communication](https://arealtimetech.com/)**, a realtime messaging platform providing WebSocket-based channels, presence tracking, end-to-end encrypted messaging, and CRDT-backed shared objects.
+
+Swift SDK for **[ART – A Realtime Tech Communication](https://arealtimetech.com/)**, a realtime communication platform for building intelligent applications with WebSocket-based messaging, AI Agents, AI Orchestrators, presence tracking, end-to-end encrypted channels, and CRDT-backed shared objects.
 
 ---
 
@@ -18,6 +19,8 @@ Swift SDK for **[ART – A Realtime Tech Communication](https://arealtimetech.co
 - End-to-end encryption support
 - Interceptors for message processing
 - Shared objects using CRDT
+- AI Agent integration
+- AI Orchestrator workflows
 
 ---
 
@@ -27,7 +30,7 @@ Swift SDK for **[ART – A Realtime Tech Communication](https://arealtimetech.co
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/aiotrixdev/art-swift-adk.git", from: "1.0.0")
+    .package(url: "https://github.com/aiotrixdev/art-swift-adk.git", from: "1.0.1")
 ]
 ```
 
@@ -59,7 +62,7 @@ ART uses a short-lived passcode for authentication:
 
 ```swift
 func fetchPasscode(creds: CredentialStore) async throws -> String {
-    let url = URL(string: "https://dev.arealtimetech.com/ws/v1/connect/passcode")!
+    let url = URL(string: "YOUR_ORCHESTRATOR_ID")!
     
     var request = URLRequest(url: url)
     request.httpMethod = "POST"
@@ -95,7 +98,7 @@ import ArtAdk
 let passcode = try await fetchPasscode(creds: creds)
 
 let adk = Adk(config: AdkConfig(
-    uri: "ws.arealtimetech.com",
+    uri: "YOUR_WEBSOCKET_URI",
     authToken: passcode,
     getCredentials: { creds }
 ))
@@ -289,6 +292,107 @@ await adk.resume()
 await adk.disconnect()
 ```
 
+## AI Workflows
+
+The Swift ADK provides first-class support for both AI Agents and Multi-Agent Orchestrators.
+
+### Agent
+
+Connect to an Agent Builder agent and start a conversation.
+
+```swift
+let agent = adk.agent("YOUR_AGENT_ID")
+
+let thread = agent.thread()
+
+await thread.listen { envelope in
+    print(envelope.event)
+}
+
+let run = await thread.run(
+    "Plan a 3-day trip to Dubai"
+)
+
+do {
+    let output = try await run.done()
+    print(output.message)
+} catch let error as AgentError {
+    print(error.message)
+}
+```
+
+### Human-in-the-Loop (HITL)
+
+When an agent requires additional information, register a feedback handler before starting the run.
+
+```swift
+thread.feedbackRequest { request, run in
+    Task {
+        try await run.sendFeedback(
+            "Budget 50,000 travelling in December"
+        )
+    }
+}
+```
+
+### Workflow Trace
+
+```swift
+await thread.listenTrace { frame in
+    print(frame)
+}
+```
+
+---
+
+### Orchestrator
+
+Connect to an Orchestrator Builder workflow.
+
+```swift
+let orchestrator = adk.orchestrator(
+    "YOUR_ORCHESTRATOR_ID"
+)
+
+let thread = try await orchestrator.thread()
+
+thread.listen { event in
+    print(event)
+}
+
+try await thread.push(
+    event: "user_input",
+    data: [
+        "message": "Plan a 3-day trip to Goa"
+    ]
+)
+```
+
+### Human-in-the-Loop
+
+```swift
+thread.listen { event in
+
+    guard
+        let content = event["content"] as? [String: Any],
+        let reply = content["reply"] as? ([String: Any]) -> Void
+    else { return }
+
+    reply([
+        "user_input":
+            "Budget 50,000 travelling in December"
+    ])
+}
+```
+
+### Workflow Trace
+
+```swift
+thread.listenTrace { frame in
+    print(frame)
+}
+```
+
 ## Documentation
 
 Full documentation is available at:
@@ -304,6 +408,8 @@ https://docs.arealtimetech.com/docs/adk/
 | Encrypted Channels | [Encryption Docs](https://docs.arealtimetech.com/docs/adk/swift/encrypted-channel) |
 | Shared Object Channels | [Shared Object Docs](https://docs.arealtimetech.com/docs/adk/swift/shared-object-channel) |
 | Interceptors | [Interceptor Docs](https://docs.arealtimetech.com/docs/adk/swift/intercept-channel) |
+| Agents | [Agent Docs](https://docs.arealtimetech.com/docs/adk/swift/agents) |
+| Orchestrator | [Orchestrator Docs](https://docs.arealtimetech.com/docs/adk/swift/orchestrator) |
 
 
 ## License
