@@ -9,6 +9,11 @@ public struct ChannelConfig {
     public var presenceUsers: [String]
     public var snapshot: Any?
     public var subscriptionID: String?
+    /// Whether this channel is orchestrator-enabled (server sends
+    /// `IsInterceptorEnabled`; the SDK exposes it under this name). Gates
+    /// `Subscription.thread(...)`; the dedicated `orch_com_<id>` channel
+    /// used by `Orchestrator` bypasses the gate via `threadUnchecked`.
+    public var orchestratorEnabled: Bool
 
     public init(
         channelName: String,
@@ -16,7 +21,8 @@ public struct ChannelConfig {
         channelType: String = "default",
         presenceUsers: [String] = [],
         snapshot: Any? = nil,
-        subscriptionID: String? = nil
+        subscriptionID: String? = nil,
+        orchestratorEnabled: Bool = false
     ) {
         self.channelName = channelName
         self.channelNamespace = channelNamespace
@@ -24,5 +30,6 @@ public struct ChannelConfig {
         self.presenceUsers = presenceUsers
         self.snapshot = snapshot
         self.subscriptionID = subscriptionID
+        self.orchestratorEnabled = orchestratorEnabled
     }
 }

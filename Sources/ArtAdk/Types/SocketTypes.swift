@@ -28,9 +28,15 @@ public struct ConnectionDetail {
 // MARK: - PushConfig
 public struct PushConfig {
     public var to: [String]
+    /// When set, the outbound message is tagged with this `thread_id` so
+    /// the server (and thread-scoped listeners) can correlate it to a
+    /// single logical thread within the channel. Used by
+    /// `OrchestratorThread`.
+    public var threadID: String?
 
-    public init(to: [String] = []) {
+    public init(to: [String] = [], threadID: String? = nil) {
         self.to = to
+        self.threadID = threadID
     }
 }
 

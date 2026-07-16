@@ -70,11 +70,20 @@ public final class Interception {
         let attemptId       = request["attempt_id"]     as? String ?? ""
         let refId           = request["ref_id"]         as? String ?? ""
 
-        let config: [String: Any] = [
+        var config: [String: Any] = [
             "channel": channel, "namespace": namespace_,
             "event": event, "interceptor_name": interceptorName,
             "from": from, "to": to as Any
         ]
+
+        // Forward agentic routing metadata so the server can correlate
+        // intercepted frames on agent/orchestrator channels. Flows through
+        // createResponse (which copies `config`) into the resolve/reject
+        // response. Mirrors js-adk-common interception.ts (ea09149 + 7f3133a).
+        for k in ["to_username", "thread_id", "node_id", "agent_node_id",
+                  "agent_id", "environment_id", "configuration_id", "root_workflow_id"] {
+            if let v = request[k] { config[k] = v }
+        }
 
         let resolve: (Any) -> Void = { [weak self] data in
             guard let self else { return }
@@ -115,8 +124,13 @@ public final class Interception {
     // MARK: - Acknowledge
     private func acknowledge(_ request: [String: Any]) {
         var response: [String: Any] = ["return_flag": "IA"]
-        ["channel", "namespace", "id", "ref_id", "from", "to",
-         "pipeline_id", "interceptor_name", "attempt_id"].forEach { k in
+        // Echo agentic routing metadata on the IA acknowledge so the server
+        // can correlate the intercepted frame. Mirrors js-adk-common
+        // interception.ts acknowledge (ea09149 + 7f3133a).
+        ["channel", "namespace", "id", "ref_id", "from", "to", "to_username",
+         "pipeline_id", "interceptor_name", "attempt_id",
+         "thread_id", "node_id", "agent_node_id", "agent_id",
+         "environment_id", "configuration_id", "root_workflow_id"].forEach { k in
             if let v = request[k] { response[k] = v }
         }
         if let data = request["data"] {

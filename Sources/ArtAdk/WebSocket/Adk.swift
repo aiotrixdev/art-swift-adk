@@ -18,8 +18,19 @@ open class Adk {
     private var adkConfig: AdkConfig?
     private var isPaused: Bool = false
     private var isConnectable: Bool = false
+    /// Set once the server reports a billing / concurrency limit. Latches
+    /// auto-reconnection off permanently — `handleOnClose` / `handleReconnection`
+    /// early-return while this is true. Mirrors js-adk-common `adk.ts`.
+    private var isLimitExceeded: Bool = false
     private var reconnectTask: Task<Void, Never>?
     public private(set) var state: AdkState = .stopped
+
+    /// Listeners notified when the transport re-establishes after a drop
+    /// (i.e. every successful connection *after* the first). Higher layers
+    /// (agent / orchestrator threads) use this to re-attach their channel
+    /// listeners. Keyed by token for `offReconnected(_:)`.
+    private var reconnectHandlers: [UUID: () -> Void] = [:]
+    private var hasConnectedOnce = false
 
     // MARK: - Init
     public init(config: AdkConfig? = nil) {
@@ -64,6 +75,19 @@ open class Adk {
 
         _ = socket.on("close") { [weak self] _ in
             self?.handleOnClose()
+        }
+
+        _ = socket.on("limitExceeded") { [weak self] data in
+            guard let self else { return }
+            let info = data as? [String: String]
+            let code = info?["code"] ?? ""
+            let errText = info?["error"] ?? ""
+            let msg = code == "CONCURRENT_LIMIT_EXCEEDED"
+                ? "[ART] Concurrent connection limit reached: \(errText). All reconnection attempts stopped. Call connect() again to retry."
+                : "[ART] Billing limit reached: \(errText). All reconnection attempts permanently stopped."
+            print(msg)
+            self.isLimitExceeded = true
+            self.isConnectable = false
         }
     }
 
@@ -144,20 +168,43 @@ open class Adk {
         await socket.initiateSocket(credentials: authConfig)
     }
 
+    // MARK: - onReconnected (re-establish notifications)
+    /// Registers `handler` to be called whenever the transport
+    /// re-establishes after a drop (not on the first connect). Returns a
+    /// token for `offReconnected(_:)`.
+    @discardableResult
+    public func onReconnected(_ handler: @escaping () -> Void) -> UUID {
+        let id = UUID()
+        reconnectHandlers[id] = handler
+        return id
+    }
+
+    /// Removes a reconnect listener registered with `onReconnected(_:)`.
+    public func offReconnected(_ id: UUID) {
+        reconnectHandlers.removeValue(forKey: id)
+    }
+
     // MARK: - Connection event handlers
     private func handleOnConnection(_ connection: ConnectionDetail) {
+        let wasReconnect = hasConnectedOnce
+        hasConnectedOnce = true
         reconnectAttempts = 0
         reconnectDelay    = 3000
         onConnectedHook(connection)
+        if wasReconnect {
+            for handler in reconnectHandlers.values { handler() }
+        }
     }
 
     private func handleOnClose() {
+        if isLimitExceeded { return }   // billing / concurrency limit — never auto-reconnect
         guard isConnectable else { return }
         socket.isReConnecting = true
         handleReconnection()
     }
 
     private func handleReconnection() {
+        if isLimitExceeded { return }   // billing / concurrency limit — never auto-reconnect
         reconnectTask?.cancel()
         reconnectTask = Task { [weak self] in
             guard let self else { return }
@@ -191,6 +238,24 @@ open class Adk {
         fn: @escaping ([String: Any], @escaping (Any) -> Void, @escaping (String) -> Void) -> Void
     ) async throws -> Interception {
         return try await socket.intercept(interceptor: interceptor, fn: fn)
+    }
+
+    // MARK: - agent
+    /// Returns an `Agent` handle for talking to the named agent over its
+    /// dedicated `agent_com_<agentId>` channel. The agent subscribes lazily
+    /// on first use of its thread. Mirrors `Adk.agent(agent_id)`.
+    public func agent(_ agentId: String) -> Agent {
+        return Agent(agentId, socket: socket)
+    }
+
+    // MARK: - orchestrator
+    /// Returns an `Orchestrator` handle for the named top-level workflow
+    /// over its dedicated `orch_com_<orchestratorId>` channel. Subscribes
+    /// lazily on first call to `Orchestrator.thread(...)`; bypasses the
+    /// channel-level `orchestratorEnabled` gate. Mirrors
+    /// `Adk.orchestrator(orchestrator_id)`.
+    public func orchestrator(_ orchestratorId: String) -> Orchestrator {
+        return Orchestrator(orchestratorId, socket: socket)
     }
 
     // MARK: - closeWebSocket
