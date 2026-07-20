@@ -292,10 +292,13 @@ await adk.resume()
 await adk.disconnect()
 ```
 
-## AI Workflows
+## Agent Lab
 
-The Swift ADK provides first-class support for both AI Agents and Multi-Agent Orchestrators.
+### ART ADK provides two AI integrations:
 
+Agent — interact with a single AI agent.
+
+Orchestrator — execute multi-agent workflows coordinated by an orchestrator.
 ### Agent
 
 Connect to an Agent Builder agent and start a conversation.
@@ -335,15 +338,8 @@ thread.feedbackRequest { request, run in
 }
 ```
 
-### Workflow Trace
 
-```swift
-await thread.listenTrace { frame in
-    print(frame)
-}
-```
 
----
 
 ### Orchestrator
 
@@ -368,30 +364,6 @@ try await thread.push(
 )
 ```
 
-### Human-in-the-Loop
-
-```swift
-thread.listen { event in
-
-    guard
-        let content = event["content"] as? [String: Any],
-        let reply = content["reply"] as? ([String: Any]) -> Void
-    else { return }
-
-    reply([
-        "user_input":
-            "Budget 50,000 travelling in December"
-    ])
-}
-```
-
-### Workflow Trace
-
-```swift
-thread.listenTrace { frame in
-    print(frame)
-}
-```
 
 ## Documentation
 
