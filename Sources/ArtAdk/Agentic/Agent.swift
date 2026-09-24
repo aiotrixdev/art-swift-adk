@@ -3,8 +3,7 @@
 // Handle for talking to a single named agent over its
 // `agent_com_<agentId>` channel. Subscription lifecycle lives on
 // `BaseWorkflow`; this type only declares the channel name and the
-// `thread()` factory. Mirrors `js-adk-common/agentic/agent.ts` and the
-// Flutter `lib/src/agentic/agent.dart`.
+// `thread()` factory.
 
 import Foundation
 
@@ -36,14 +35,39 @@ public final class Agent: BaseWorkflow {
 
     public override var channelName: String { "agent_com_\(agentId)" }
 
-    /// Creates or reconnects to an agent thread.
-       ///
-       /// - Parameter threadId:
-       ///   Existing thread identifier. If `nil`, a new thread will be
-       ///   created by the server.
-       ///
-       /// - Returns: An `AgentThread` instance.
-       public func thread(_ threadId: String? = nil) -> AgentThread {
-           AgentThread(agent: self, threadId: threadId)
-       }
+    public func thread(_ threadId: String? = nil) -> AgentThread {
+        AgentThread(agent: self, threadId: threadId)
+    }
+
+    // MARK: - Storage (agent-scoped)
+
+    /// Uploads a local file, scoped to this agent: `configId` is always
+    /// set to `agentId`, whatever `options` contains.
+    @discardableResult
+    public func upload(fileURL: URL, options: UploadOptions = UploadOptions()) async throws -> FileRef {
+        var opts = options
+        opts.configId = agentId
+        return try await Storage().upload(fileURL: fileURL, options: opts)
+    }
+
+    /// Byte-based variant of `upload(fileURL:options:)`, for callers that
+    /// already have the file in memory rather than on disk.
+    @discardableResult
+    public func upload(
+        data: Data,
+        filename: String? = nil,
+        contentType: String? = nil,
+        options: UploadOptions = UploadOptions()
+    ) async throws -> FileRef {
+        var opts = options
+        opts.configId = agentId
+        return try await Storage().upload(data: data, filename: filename, contentType: contentType, options: opts)
+    }
+
+    /// Lists files scoped to this agent's `agentId`.
+    public func listFiles(options: ListOptions = ListOptions()) async throws -> StorageFileList {
+        var opts = options
+        opts.configId = agentId
+        return try await Storage().listFiles(options: opts)
+    }
 }

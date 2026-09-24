@@ -118,8 +118,7 @@ public final class Socket: NSObject, IWebsocketHandler {
             // WebSocket failed — fall through to the next transport.
             // (Previously this `catch` returned, which left the SSE and
             // long-poll tiers below as dead code and disabled the
-            // transport fallback entirely. Mirrors the Flutter
-            // `initiateSocket` fall-through.)
+            // transport fallback entirely.)
         }
 
         // 2. SSE
@@ -136,8 +135,7 @@ public final class Socket: NSObject, IWebsocketHandler {
         lpClient.start(connectionId: connection?.connectionId)
         // Long-poll has no `art_ready` handshake to bind a connection, so
         // synthesize one — otherwise `wait()` never resolves and `push()`
-        // throws `.notConnected` in poll mode. Mirrors the Flutter
-        // `_openLocalFallbackConnection()` call in `initiateSocket`.
+        // throws `.notConnected` in poll mode.
         openLocalFallbackConnection()
     }
     
@@ -266,8 +264,7 @@ public final class Socket: NSObject, IWebsocketHandler {
     ///
     /// Idempotent: a no-op once a real (or prior local) connection is
     /// active. If a later `art_ready` arrives, `handleConnectionBinding`
-    /// upgrades the connection to the server-issued id. Mirrors the Flutter
-    /// `_openLocalFallbackConnection()`.
+    /// upgrades the connection to the server-issued id.
     private func openLocalFallbackConnection() {
         if isConnectionActive && connection != nil { return }
         connection = ConnectionDetail(
@@ -411,23 +408,24 @@ public final class Socket: NSObject, IWebsocketHandler {
                 websocketHandler: self, process: "subscribe"
             )
         }
-        let buf = withSocketLock { () -> [(event: String, payload: [String: Any])]? in
+        // Register and replay frames that arrived before the subscription
+        // existed, in one locked step: later frames are routed to the same
+        // ordered queue, so arrival order is preserved.
+        withSocketLock {
             subscriptions[channel] = subscription
-            return pendingIncomingMessages.removeValue(forKey: channel)
-        }
-
-        // Replay buffered messages
-        if let buf = buf {
-            for item in buf {
-                await subscription.handleMessage(event: item.event, payload: item.payload)
+            if let buffered = pendingIncomingMessages.removeValue(forKey: channel) {
+                for item in buffered {
+                    subscription.enqueue(event: item.event, payload: item.payload)
+                }
             }
         }
-        
+
         return subscription
     }
-    
+
     private func validateSubscription(channelName: String, process: String) async throws -> ChannelConfig? {
-        if ["art_config", "art_secure"].contains(channelName) {
+        // Reserved channels are handled locally.
+        if BaseSubscription.reservedChannels.contains(channelName) {
             return ChannelConfig(channelName: channelName, channelNamespace: "",
                                  channelType: "default", presenceUsers: [], snapshot: nil, subscriptionID: "")
         }
@@ -511,7 +509,7 @@ public final class Socket: NSObject, IWebsocketHandler {
         // Limit block — a billing / concurrency-limit rejection arrives with no
         // channel, carrying only `code` + `error`. Surface it as `limitExceeded`
         // so the Adk layer can permanently stop reconnecting, then drop the
-        // frame. Mirrors js-adk-common socket.ts.
+        // frame.
         if channel.isEmpty {
             let code = parsed["code"] as? String ?? ""
             if code == "CONNECTION_MINUTES_LIMIT_EXCEEDED" || code == "CONCURRENT_LIMIT_EXCEEDED" {
@@ -536,26 +534,33 @@ public final class Socket: NSObject, IWebsocketHandler {
         payload.removeValue(forKey: "content")
         payload["data"] = rawData
         
+        if event == "error" {
+            ArtLog.error("Received error message: \(parsed)")
+        }
+
         // Interceptor routing
         if let iName = interceptorName, !iName.isEmpty {
             let interception = withSocketLock { interceptors[iName] }
             if let interception = interception {
                 Task { await interception.handleMessage(channel: channel, data: payload) }
             } else {
+                ArtLog.warn("No Interception found for channel: \(channel)")
             }
             return
         }
-        
-        // Subscription routing
+
+        // Subscription routing — the subscription's ordered queue keeps
+        // frames in arrival order; unknown channels are buffered until
+        // `subscribe` registers them.
         var subKey = channel
         if !namespace.isEmpty { subKey += ":\(namespace)" }
-        
-        let sub = withSocketLock { subscriptions[subKey] }
 
-        if let sub = sub {
-            Task { await sub.handleMessage(event: event, payload: payload) }
-        } else {
-            withSocketLock { pendingIncomingMessages[subKey, default: []].append((event: event, payload: payload)) }
+        withSocketLock {
+            if let sub = subscriptions[subKey] {
+                sub.enqueue(event: event, payload: payload)
+            } else {
+                pendingIncomingMessages[subKey, default: []].append((event: event, payload: payload))
+            }
         }
     }
     
@@ -617,10 +622,11 @@ public final class Socket: NSObject, IWebsocketHandler {
     }
     
     private func runHeartbeatPayload() -> [String: Any] {
-        let subs = withSocketLock {
-            subscriptions.map { (k, v) -> [String: Any] in
-                ["name": k, "presenceTracking": v.isListening]
-            }
+        // Copy under the socket lock, read subscription state outside it
+        // (lock order is subscription → socket, never the reverse).
+        let snapshot = withSocketLock { Array(subscriptions) }
+        let subs = snapshot.map { (k, v) -> [String: Any] in
+            ["name": k, "presenceTracking": v.isListening]
         }
         return ["connectionId": connection?.connectionId as Any, "timestamp": Date().timeIntervalSince1970 * 1000, "subscriptions": subs]
     }
@@ -688,7 +694,7 @@ public final class Socket: NSObject, IWebsocketHandler {
 //        return "connected"
 //    }
     
-    // MARK: - Event listeners (mirrors adk.ts on/off)
+    // MARK: - Event listeners
     @discardableResult
     public func on(_ event: String, handler: @escaping (Any) -> Void) -> UUID {
         return emitter.on(event, handler: handler)

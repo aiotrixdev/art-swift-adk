@@ -1,8 +1,6 @@
 // Sources/ArtAdk/Agentic/Orchestrator.swift
 //
-// Top-level handle for an orchestrator-managed workflow. Mirrors
-// `js-adk-common/agentic/orchestrator.ts` and the Flutter
-// `lib/src/agentic/orchestrator.dart`.
+// Top-level handle for an orchestrator-managed workflow.
 
 import Foundation
 
@@ -48,5 +46,36 @@ public final class Orchestrator: BaseWorkflow {
     public func thread(threadId: String? = nil) async throws -> OrchestratorThread {
         let sub = try await getSubscription()
         return sub.threadUnchecked(threadId: threadId)
+    }
+
+    // MARK: - Storage (orchestrator-scoped)
+
+    /// Uploads a local file scoped to this orchestrator
+    /// (`config_id` = `orchestratorId`).
+    @discardableResult
+    public func upload(fileURL: URL, options: UploadOptions = UploadOptions()) async throws -> FileRef {
+        var opts = options
+        opts.configId = orchestratorId
+        return try await Storage().upload(fileURL: fileURL, options: opts)
+    }
+
+    /// In-memory variant of `upload(fileURL:options:)`.
+    @discardableResult
+    public func upload(
+        data: Data,
+        filename: String? = nil,
+        contentType: String? = nil,
+        options: UploadOptions = UploadOptions()
+    ) async throws -> FileRef {
+        var opts = options
+        opts.configId = orchestratorId
+        return try await Storage().upload(data: data, filename: filename, contentType: contentType, options: opts)
+    }
+
+    /// Lists files scoped to this orchestrator.
+    public func listFiles(options: ListOptions = ListOptions()) async throws -> StorageFileList {
+        var opts = options
+        opts.configId = orchestratorId
+        return try await Storage().listFiles(options: opts)
     }
 }
