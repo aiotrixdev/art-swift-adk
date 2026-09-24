@@ -74,15 +74,23 @@ return            }
         let returnFlag = payload["return_flag"] as? String ?? ""
         if returnFlag == "SA" { return }
 
-        // Presence events
+        // Presence events — emit the parsed `data`; the raw string would
+        // never match `fetchPresence`'s dictionary handler.
         if event == "art_presence" {
             if let content = payload["data"] {
-                emitter.emit("art_presence", content)
+                if let text = content as? String, let parsed = ArtJSON.parse(text) {
+                    emitter.emit("art_presence", parsed)
+                } else {
+                    emitter.emit("art_presence", content)
+                }
             }
             return
         }
 
-        // ---- CRDT UPDATE / MERGE EVENTS ----
+        // ---- CRDT UPDATE EVENTS ----
+        // Only `update` frames carry remote ops.
+        guard event == "update" else { return }
+
         let rawContent = payload["content"] ?? payload["data"]
         guard let content = rawContent else { return }
 

@@ -24,6 +24,7 @@ public let agentEvents: [String] = [
     "human_input_request",
     "agent_wait_response",
     "planner_correction_request",
+    "thread_state",
 ]
 
 /// Returns `true` if `name` is a recognised agent event type.
@@ -291,6 +292,162 @@ public struct PlannerCorrection: EnvelopeMeta {
     }
 }
 
+// MARK: - ThreadState
+
+/// Operational phase of a thread. Unrecognised server values are kept
+/// in `.unknown`.
+public enum ThreadStatePhase: Hashable, Sendable {
+    case idle
+    case submitted
+    case queued
+    case running
+    case waitingForAgent
+    case waitingForApproval
+    case waitingForWorkspace
+    case completed
+    case failed
+    case cancelled
+    case unknown(String)
+
+    public init(rawValue: String) {
+        switch rawValue {
+        case "idle": self = .idle
+        case "submitted": self = .submitted
+        case "queued": self = .queued
+        case "running": self = .running
+        case "waiting_for_agent": self = .waitingForAgent
+        case "waiting_for_approval": self = .waitingForApproval
+        case "waiting_for_workspace": self = .waitingForWorkspace
+        case "completed": self = .completed
+        case "failed": self = .failed
+        case "cancelled": self = .cancelled
+        default: self = .unknown(rawValue)
+        }
+    }
+
+    /// Wire value (e.g. `waiting_for_agent`).
+    public var rawValue: String {
+        switch self {
+        case .idle: return "idle"
+        case .submitted: return "submitted"
+        case .queued: return "queued"
+        case .running: return "running"
+        case .waitingForAgent: return "waiting_for_agent"
+        case .waitingForApproval: return "waiting_for_approval"
+        case .waitingForWorkspace: return "waiting_for_workspace"
+        case .completed: return "completed"
+        case .failed: return "failed"
+        case .cancelled: return "cancelled"
+        case .unknown(let value): return value
+        }
+    }
+}
+
+/// Which component reported a thread state.
+public enum ThreadStateSource: Hashable, Sendable {
+    case client
+    case poolManager
+    case agent
+    case orchestrator
+    case workspace
+    case unknown(String)
+
+    public init(rawValue: String) {
+        switch rawValue {
+        case "client": self = .client
+        case "pool_manager": self = .poolManager
+        case "agent": self = .agent
+        case "orchestrator": self = .orchestrator
+        case "workspace": self = .workspace
+        default: self = .unknown(rawValue)
+        }
+    }
+
+    /// Wire value (e.g. `pool_manager`).
+    public var rawValue: String {
+        switch self {
+        case .client: return "client"
+        case .poolManager: return "pool_manager"
+        case .agent: return "agent"
+        case .orchestrator: return "orchestrator"
+        case .workspace: return "workspace"
+        case .unknown(let value): return value
+        }
+    }
+}
+
+/// Current operational state of one thread — runtime state for UI, not
+/// telemetry. Delivered by `AgentThread.listenState` /
+/// `OrchestratorThread.listenState` and by `thread_state` events.
+public struct ThreadState {
+    public var threadId: String
+    public var phase: ThreadStatePhase
+    public var source: ThreadStateSource
+    public var message: String
+    public var reason: String?
+    public var nodeId: String?
+    public var nodeName: String?
+    public var taskId: String?
+    public var workspaceId: String?
+    public var agentId: String?
+    public var queuePosition: Int?
+    /// ISO-8601 timestamp.
+    public var occurredAt: String
+    /// Server ordering; later states with a lower sequence are ignored.
+    public var sequence: Int?
+    public var details: [String: Any]?
+
+    public init(
+        threadId: String,
+        phase: ThreadStatePhase,
+        source: ThreadStateSource,
+        message: String,
+        reason: String? = nil,
+        nodeId: String? = nil,
+        nodeName: String? = nil,
+        taskId: String? = nil,
+        workspaceId: String? = nil,
+        agentId: String? = nil,
+        queuePosition: Int? = nil,
+        occurredAt: String,
+        sequence: Int? = nil,
+        details: [String: Any]? = nil
+    ) {
+        self.threadId = threadId
+        self.phase = phase
+        self.source = source
+        self.message = message
+        self.reason = reason
+        self.nodeId = nodeId
+        self.nodeName = nodeName
+        self.taskId = taskId
+        self.workspaceId = workspaceId
+        self.agentId = agentId
+        self.queuePosition = queuePosition
+        self.occurredAt = occurredAt
+        self.sequence = sequence
+        self.details = details
+    }
+
+    /// Parses a `thread_state` content map.
+    public init(from m: [String: Any]) {
+        threadId = m["thread_id"] as? String ?? ""
+        phase = ThreadStatePhase(rawValue: m["phase"] as? String ?? "idle")
+        source = ThreadStateSource(rawValue: m["source"] as? String ?? "client")
+        message = m["message"] as? String ?? ""
+        reason = m["reason"] as? String
+        nodeId = m["node_id"] as? String
+        nodeName = m["node_name"] as? String
+        taskId = m["task_id"] as? String
+        workspaceId = m["workspace_id"] as? String
+        agentId = m["agent_id"] as? String
+        queuePosition = ArtJSON.int(m["queue_position"])
+        occurredAt = m["occurred_at"] as? String ?? ""
+        sequence = ArtJSON.int(m["sequence"])
+        details = m["details"] as? [String: Any]
+    }
+}
+
 // MARK: - UnknownAgentEvent
 
 /// Catch-all payload when the server emits an event the SDK does not yet
@@ -311,15 +468,15 @@ public struct UnknownAgentEvent {
 
 /// The typed payload carried by an `AgentEventEnvelope`.
 ///
-/// Swift-idiomatic replacement for the Dart `Object content` field: an
-/// enum with associated values gives exhaustive, type-safe switching at
-/// the call site.
+/// An enum with associated values gives exhaustive, type-safe switching
+/// at the call site.
 public enum AgentEvent {
     case output(AgentOutput)
     case error(AgentError)
     case humanInput(HumanInputRequest)
     case wait(AgentWait)
     case plannerCorrection(PlannerCorrection)
+    case threadState(ThreadState)
     case unknown(UnknownAgentEvent)
 }
 
@@ -332,10 +489,16 @@ public struct AgentEventEnvelope {
     public let event: String
     /// The typed payload.
     public let payload: AgentEvent
+    /// The event's fields exactly as the server sent them,
+    /// including any the typed payload doesn't model — use it to render a
+    /// response generically. On `human_input_request` it also holds the
+    /// ADK-injected `reply` closure, which is not JSON.
+    public let content: [String: Any]
 
-    public init(event: String, payload: AgentEvent) {
+    public init(event: String, payload: AgentEvent, content: [String: Any] = [:]) {
         self.event = event
         self.payload = payload
+        self.content = content
     }
 
     /// Whether `payload` is one of the typed (non-`.unknown`) variants.
@@ -347,16 +510,28 @@ public typealias AgentUserListener = (AgentEventEnvelope) -> Void
 
 // MARK: - parseAgentEvent
 
+/// `value` as a field map: an object as-is, or an object encoded as a JSON
+/// string. The agent backend double-encodes some event bodies — `content`
+/// arrives as a JSON *string* (e.g. `agent_output` / `agent_error`) rather
+/// than an object (e.g. `thread_state`) — so the string form is decoded
+/// before any field is read.
+private func agentContentMap(_ value: Any?) -> [String: Any]? {
+    if let map = value as? [String: Any] { return map }
+    if let text = value as? String {
+        return ArtJSON.parse(text) as? [String: Any]
+    }
+    return nil
+}
+
 /// Resolves the variant map inside a raw `content` payload.
 ///
 /// Two shapes occur depending on how `Subscription` decoded the wire
 /// frame: the variant map may sit at the top level (`raw["type"]`), or be
 /// nested one level deeper (`raw["content"]["type"]`) when the whole
-/// envelope was passed through verbatim. Mirrors the `_resolveInnerContent`
-/// fix on the Flutter controller.
+/// envelope was passed through verbatim.
 private func resolveAgentContent(_ raw: [String: Any]) -> [String: Any] {
     if raw["type"] is String { return raw }
-    if let nested = raw["content"] as? [String: Any], nested["type"] is String {
+    if let nested = agentContentMap(raw["content"]), nested["type"] is String {
         return nested
     }
     return raw
@@ -376,7 +551,7 @@ private func resolveAgentContent(_ raw: [String: Any]) -> [String: Any] {
 /// still flow through `AgentThread`).
 public func parseAgentEvent(_ raw: [String: Any]) -> AgentEventEnvelope {
     let wireEvent = raw["event"] as? String ?? ""
-    let outerContent = (raw["content"] as? [String: Any]) ?? raw
+    let outerContent = agentContentMap(raw["content"]) ?? raw
     let contentMap = resolveAgentContent(outerContent)
 
     let rawType = contentMap["type"] as? String ?? ""
@@ -386,32 +561,44 @@ public func parseAgentEvent(_ raw: [String: Any]) -> AgentEventEnvelope {
     case "agent_general_response", "agent_output":
         return AgentEventEnvelope(
             event: "agent_general_response",
-            payload: .output(AgentOutput(from: contentMap))
+            payload: .output(AgentOutput(from: contentMap)),
+            content: contentMap
         )
     case "agent_error_response", "agent_error":
         return AgentEventEnvelope(
             event: "agent_error_response",
-            payload: .error(AgentError(from: contentMap))
+            payload: .error(AgentError(from: contentMap)),
+            content: contentMap
         )
     case "human_input_request":
         return AgentEventEnvelope(
             event: "human_input_request",
-            payload: .humanInput(HumanInputRequest(from: contentMap))
+            payload: .humanInput(HumanInputRequest(from: contentMap)),
+            content: contentMap
         )
     case "agent_wait_response", "agent_wait":
         return AgentEventEnvelope(
             event: "agent_wait_response",
-            payload: .wait(AgentWait(from: contentMap))
+            payload: .wait(AgentWait(from: contentMap)),
+            content: contentMap
         )
     case "planner_correction_request", "planner_correction":
         return AgentEventEnvelope(
             event: "planner_correction_request",
-            payload: .plannerCorrection(PlannerCorrection(from: contentMap))
+            payload: .plannerCorrection(PlannerCorrection(from: contentMap)),
+            content: contentMap
+        )
+    case "thread_state":
+        return AgentEventEnvelope(
+            event: "thread_state",
+            payload: .threadState(ThreadState(from: contentMap)),
+            content: contentMap
         )
     default:
         return AgentEventEnvelope(
             event: wireEvent,
-            payload: .unknown(UnknownAgentEvent(event: wireEvent, content: contentMap))
+            payload: .unknown(UnknownAgentEvent(event: wireEvent, content: contentMap)),
+            content: contentMap
         )
     }
 }
