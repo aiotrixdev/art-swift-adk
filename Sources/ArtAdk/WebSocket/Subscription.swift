@@ -4,6 +4,12 @@ import Foundation
 
 public final class Subscription: BaseSubscription {
 
+    /// Buffered thread-scoped events: threadId → ordered event buffer.
+    private var threadBufferStorage: [String: EventBuffer] = [:]
+
+    /// Live `OrchestratorThread`s registered on this subscription.
+    private var threads: [String: OrchestratorThread] = [:]
+
     public override init(
         connectionID: String,
         channelConfig: ChannelConfig,
@@ -18,45 +24,57 @@ public final class Subscription: BaseSubscription {
         )
     }
 
+    /// Snapshot of buffered thread-scoped events (threadId → event → entries),
+    /// replayed when a thread listener attaches.
+    public var threadBuffers: [String: [String: [[String: Any]]]] {
+        get { stateLock.sync { threadBufferStorage.mapValues { $0.dictionary } } }
+        set { stateLock.sync { threadBufferStorage = newValue.mapValues { EventBuffer($0) } } }
+    }
+
     // MARK: - listen
-    public func listen(_ callback: @escaping ([String: Any]) -> Void) {
-
-        for (evt, msgs) in messageBuffer {
-            for reqData in msgs {
-                callback([
-                    "event": evt,
-                    "content": reqData["content"] ?? NSNull()
-                ])
-                acknowledge(reqData, "CA")
+    /// Drains buffered events, then receives every future non-thread event
+    /// as `["event": name, "content": payload]`. Returns a token for
+    /// `remove(event: "all", id:)`.
+    @discardableResult
+    public func listen(_ callback: @escaping ([String: Any]) -> Void) -> UUID {
+        let (drained, id) = stateLock.sync { () -> ([(event: String, entry: [String: Any])], UUID) in
+            let drained = bufferStorage.drainAll()
+            let id = emitter.on("all") { data in
+                if let d = data as? [String: Any] { callback(d) }
             }
+            return (drained, id)
         }
-        messageBuffer.removeAll()
-
-        _ = emitter.on("all") { data in
-            if let d = data as? [String: Any] {
-                callback(d)
-            }
-        }
+        deliver(drained, to: callback)
+        return id
     }
 
     // MARK: - bind
-    public func bind(event: String, callback: @escaping (Any) -> Void) {
-
-        if let msgs = messageBuffer[event] {
-            for reqData in msgs {
-                callback(reqData["content"] ?? NSNull())
-                acknowledge(reqData, "CA")
-            }
-            messageBuffer.removeValue(forKey: event)
+    /// Replays buffered payloads for `event`, then receives future ones.
+    /// Returns a token for `remove(event:id:)`.
+    @discardableResult
+    public func bind(event: String, callback: @escaping (Any) -> Void) -> UUID {
+        let (drained, id) = stateLock.sync { () -> ([[String: Any]], UUID) in
+            (bufferStorage.take(event), emitter.on(event, handler: callback))
         }
-
-        _ = emitter.on(event, handler: callback)
+        for entry in drained {
+            callback(entry["content"] ?? NSNull())
+            acknowledge(entry, "CA")
+        }
+        return id
     }
 
     // MARK: - remove
+    /// Removes every listener for `event` and drops its buffered payloads.
     public func remove(event: String) {
         emitter.off(event)
-        messageBuffer.removeValue(forKey: event)
+        stateLock.sync { _ = bufferStorage.take(event) }
+    }
+
+    /// Removes the single listener registered with token `id` for `event`
+    /// and drops the event's buffered payloads.
+    public func remove(event: String, id: UUID) {
+        emitter.off(event, id: id)
+        stateLock.sync { _ = bufferStorage.take(event) }
     }
 
     // MARK: - push
@@ -69,21 +87,60 @@ public final class Subscription: BaseSubscription {
         try await super.push(event: event, data: data, options: options)
     }
 
+    // MARK: - Storage (channel-scoped)
+    //
+    // Only on orchestrator-enabled channels, scoped to the channel name.
+
+    /// Uploads a local file scoped to this channel (`config_id` = channel
+    /// name). Throws unless the channel is orchestrator-enabled.
+    @discardableResult
+    public func upload(fileURL: URL, options: UploadOptions = UploadOptions()) async throws -> FileRef {
+        try await Storage().upload(fileURL: fileURL, options: try channelScoped(options))
+    }
+
+    /// In-memory variant of `upload(fileURL:options:)`.
+    @discardableResult
+    public func upload(
+        data: Data,
+        filename: String? = nil,
+        contentType: String? = nil,
+        options: UploadOptions = UploadOptions()
+    ) async throws -> FileRef {
+        try await Storage().upload(
+            data: data, filename: filename, contentType: contentType,
+            options: try channelScoped(options)
+        )
+    }
+
+    /// Lists files scoped to this channel. Throws unless the channel is
+    /// orchestrator-enabled.
+    public func listFiles(options: ListOptions = ListOptions()) async throws -> StorageFileList {
+        let config = try requireOrchestratorChannel()
+        var scoped = options
+        scoped.configId = config.channelName
+        return try await Storage().listFiles(options: scoped)
+    }
+
+    private func channelScoped(_ options: UploadOptions) throws -> UploadOptions {
+        let config = try requireOrchestratorChannel()
+        var scoped = options
+        scoped.configId = config.channelName
+        return scoped
+    }
+
+    private func requireOrchestratorChannel() throws -> ChannelConfig {
+        let config = channelConfig
+        guard config.orchestratorEnabled else {
+            throw UploadError("Storage requires an orchestrator-enabled channel", step: .validate)
+        }
+        return config
+    }
+
     // MARK: - Thread-scoped routing
     //
-    // Buffers and listener wiring for thread-scoped (orchestrator) events.
-    // Inbound events tagged with a `thread_id` are emitted on the keys
-    // `"<threadId>-<event>"` / `"<threadId>-all"`, mirroring the Flutter
-    // `Subscription` thread plumbing. `OrchestratorThread` (added with the
-    // orchestrator layer) drives these via the attach/detach helpers.
-
-    /// Buffered thread-scoped events keyed by `threadId → event → entries`,
-    /// replayed when a thread listener attaches.
-    public var threadBuffers: [String: [String: [[String: Any]]]] = [:]
-
-    /// Live `OrchestratorThread`s registered on this subscription, keyed by
-    /// thread id.
-    private var threads: [String: OrchestratorThread] = [:]
+    // Inbound events tagged with a `thread_id` are emitted on
+    // `"<threadId>-<event>"` / `"<threadId>-all"` and buffered per thread
+    // until a thread listener attaches.
 
     /// Returns an `OrchestratorThread` for `threadId` on this channel.
     ///
@@ -93,7 +150,7 @@ public final class Subscription: BaseSubscription {
     public func thread(threadId: String? = nil) throws -> OrchestratorThread {
         guard channelConfig.orchestratorEnabled else {
             throw ARTError.serverError(
-                "Channel \(channelConfig.channelName) is not orchestrator-enabled"
+                "Thread works only in case of orchestrator enabled channels"
             )
         }
         return threadUnchecked(threadId: threadId)
@@ -103,79 +160,86 @@ public final class Subscription: BaseSubscription {
     /// gate. For callers (e.g. `Orchestrator`) that have already committed
     /// to orchestrator semantics on a dedicated channel.
     public func threadUnchecked(threadId: String? = nil) -> OrchestratorThread {
-        if let threadId,
-           let existing = threads[threadId],
-           !existing.isDisposed {
-            return existing
+        stateLock.sync {
+            if let threadId,
+               let existing = threads[threadId],
+               !existing.isDisposed {
+                return existing
+            }
+            let thread = OrchestratorThread(self, threadId)
+            threads[thread.threadId] = thread
+            return thread
         }
-        let thread = OrchestratorThread(self, threadId)
-        threads[thread.threadId] = thread
-        return thread
     }
 
     /// Returns the live `OrchestratorThread` for `threadId`, or `nil`.
     public func getThread(_ threadId: String) -> OrchestratorThread? {
-        threads[threadId]
+        stateLock.sync { threads[threadId] }
     }
 
     /// Removes `threadId` from the registry and drops any buffered messages
     /// for it. Invoked by `OrchestratorThread.dispose()`.
     public func unregisterThread(_ threadId: String) {
-        threads.removeValue(forKey: threadId)
-        threadBuffers.removeValue(forKey: threadId)
+        stateLock.sync {
+            threads.removeValue(forKey: threadId)
+            threadBufferStorage.removeValue(forKey: threadId)
+        }
     }
 
     /// Drains buffered events for `threadId` and subscribes `callback` to
     /// every future event tagged with that thread id. Each invocation
-    /// receives a map with `event` and `content` keys.
+    /// receives `["event": name, "content": payload]`. Returns a token for
+    /// `detachThreadListener(_:_:id:)` with event `"all"`.
+    @discardableResult
     public func attachThreadListener(
         _ threadId: String,
         _ callback: @escaping ([String: Any]) -> Void
-    ) {
-        if let buf = threadBuffers[threadId] {
-            for (evt, msgs) in buf {
-                for reqData in msgs {
-                    callback([
-                        "event": evt,
-                        "content": reqData["content"] ?? NSNull()
-                    ])
-                    acknowledge(reqData, "CA")
-                }
+    ) -> UUID {
+        let (drained, id) = stateLock.sync { () -> ([(event: String, entry: [String: Any])], UUID) in
+            var buffer = threadBufferStorage.removeValue(forKey: threadId) ?? EventBuffer()
+            let drained = buffer.drainAll()
+            let id = emitter.on("\(threadId)-all") { data in
+                if let d = data as? [String: Any] { callback(d) }
             }
-            threadBuffers.removeValue(forKey: threadId)
+            return (drained, id)
         }
-
-        _ = emitter.on("\(threadId)-all") { data in
-            if let d = data as? [String: Any] {
-                callback(d)
-            }
-        }
+        deliver(drained, to: callback)
+        return id
     }
 
     /// Subscribes `callback` to a single named `event` within `threadId`,
-    /// replaying any buffered payloads for that pair first.
+    /// replaying any buffered payloads for that pair first. Returns a token
+    /// for `detachThreadListener(_:_:id:)`.
+    @discardableResult
     public func attachThreadBind(
         _ threadId: String,
         _ event: String,
         _ callback: @escaping (Any) -> Void
-    ) {
-        if var buf = threadBuffers[threadId], let msgs = buf[event] {
-            for reqData in msgs {
-                callback(reqData["content"] ?? NSNull())
-                acknowledge(reqData, "CA")
-            }
-            buf.removeValue(forKey: event)
-            threadBuffers[threadId] = buf
+    ) -> UUID {
+        let (drained, id) = stateLock.sync { () -> ([[String: Any]], UUID) in
+            let drained = threadBufferStorage[threadId]?.take(event) ?? []
+            let id = emitter.on("\(threadId)-\(event)", handler: callback)
+            return (drained, id)
         }
-
-        _ = emitter.on("\(threadId)-\(event)", handler: callback)
+        for entry in drained {
+            callback(entry["content"] ?? NSNull())
+            acknowledge(entry, "CA")
+        }
+        return id
     }
 
-    /// Removes the listener(s) attached for (`threadId`, `event`) and drops
+    /// Removes every listener attached for (`threadId`, `event`) and drops
     /// any buffered payloads for that pair.
     public func detachThreadListener(_ threadId: String, _ event: String) {
         emitter.off("\(threadId)-\(event)")
-        threadBuffers[threadId]?.removeValue(forKey: event)
+        stateLock.sync { _ = threadBufferStorage[threadId]?.take(event) }
+    }
+
+    /// Removes the single listener registered with token `id` for
+    /// (`threadId`, `event`) and drops the pair's buffered payloads.
+    public func detachThreadListener(_ threadId: String, _ event: String, id: UUID) {
+        emitter.off("\(threadId)-\(event)", id: id)
+        stateLock.sync { _ = threadBufferStorage[threadId]?.take(event) }
     }
 
     private func emitThreadEvent(_ event: String, _ content: Any, _ threadId: String?) {
@@ -183,11 +247,25 @@ public final class Subscription: BaseSubscription {
         emitter.emit(key, content)
     }
 
-    private func bufferEvent(_ event: String, _ entry: [String: Any]) {
+    /// Must be called with `stateLock` held.
+    private func bufferEventLocked(_ event: String, _ entry: [String: Any]) {
         if let tid = entry["thread_id"] as? String, !tid.isEmpty {
-            threadBuffers[tid, default: [:]][event, default: []].append(entry)
+            threadBufferStorage[tid, default: EventBuffer()].append(event, entry)
         } else {
-            messageBuffer[event, default: []].append(entry)
+            bufferStorage.append(event, entry)
+        }
+    }
+
+    private func deliver(
+        _ drained: [(event: String, entry: [String: Any])],
+        to callback: ([String: Any]) -> Void
+    ) {
+        for item in drained {
+            callback([
+                "event": item.event,
+                "content": item.entry["content"] ?? NSNull()
+            ])
+            acknowledge(item.entry, "CA")
         }
     }
 
@@ -217,10 +295,16 @@ public final class Subscription: BaseSubscription {
                     data: ["username": payload["from_username"] ?? ""],
                     listen: true
                 ) as? [String: Any],
-                let innerData = secureResult["data"] as? [String: Any],
-                let pubKey = innerData["public_key"] as? String else { return }
+                let innerData = secureResult["data"] as? [String: Any] else {
+                    ArtLog.error("secured_public_key lookup failed for \(payload["from_username"] ?? "?")")
+                    return
+                }
 
-                if innerData["status"] as? String == "unsuccessfull" { return }
+                if innerData["status"] as? String == "unsuccessfull" {
+                    ArtLog.error("secured_public_key: \(innerData["error"] ?? "unsuccessful")")
+                    return
+                }
+                guard let pubKey = innerData["public_key"] as? String else { return }
 
                 if let encryptedData = mutablePayload["data"] as? String {
                     mutablePayload["data"] = try await websocketHandler.decrypt(
@@ -230,30 +314,25 @@ public final class Subscription: BaseSubscription {
                 }
 
             } catch {
+                ArtLog.error("Failed to decrypt secure message: \(error)")
                 return
             }
         }
 
         // -------------------------------------------------------
-        // PARSE CONTENT-------------------------------------------------
-        var content: Any = [:]
+        // PARSE CONTENT (`data` arrives as JSON text)
+        // -------------------------------------------------------
+        var content: Any = [String: Any]()
 
         if let dataVal = mutablePayload["data"] {
-            // payload has 'data' key — parse it
-            if let dataStr = dataVal as? String,
-               let jsonData = dataStr.data(using: .utf8),
-               let parsed = try? JSONSerialization.jsonObject(with: jsonData) {
+            if let dataStr = dataVal as? String, let parsed = ArtJSON.parse(dataStr) {
                 content = parsed
             } else {
                 // already a parsed object (e.g. [String: Any])
                 content = dataVal
             }
         } else {
-            // fallback: try parsing the whole payload
-            if let jsonData = try? JSONSerialization.data(withJSONObject: mutablePayload),
-               let parsed = try? JSONSerialization.jsonObject(with: jsonData) {
-                content = parsed
-            }
+            content = mutablePayload
         }
 
         // -------------------------------------------------------
@@ -262,19 +341,24 @@ public final class Subscription: BaseSubscription {
         // When the server requests feedback, attach a `reply` closure to the
         // content so consumers can answer (sends `return_flag: "HF"`). The
         // closure is stored under the "reply" key as `(Any) -> Void`; strip it
-        // before JSON-serializing content for display. Mirrors
-        // js-adk-common subscription.ts (requestFeedback / root_workflow_id).
+        // before JSON-serializing content for display.
         let contentType = (content as? [String: Any])?["type"] as? String
         let humanFeedbackRequest =
             returnFlag == "requestFeedback" ||
             event == "human_input_request" ||
             contentType == "human_input_request"
         if humanFeedbackRequest, var dict = content as? [String: Any] {
-            dict["reply"] = { [weak self] (replyData: Any) in
+            // Explicitly typed: an inferred single-expression closure over
+            // `self?.…` would be `(Any) -> ()?` and fail the documented
+            // `as? (Any) -> Void` cast.
+            let reply: (Any) -> Void = { [weak self] replyData in
                 self?.sendHumanFeedback(originalReq: payload, replyData: replyData)
             }
+            dict["reply"] = reply
             content = dict
         }
+
+        let threadId = mutablePayload["thread_id"] as? String
 
         // -------------------------------------------------------
         // PRESENCE EVENT
@@ -288,11 +372,9 @@ public final class Subscription: BaseSubscription {
         // TRACE (diagnostic / telemetry) FRAMES
         // -------------------------------------------------------
         // Emitted directly to their listeners, bypassing the subscribed-state
-        // gate + the normal buffering path (mirrors js-adk-common
-        // subscription.ts). Consumers attach via `AgentThread.listenTrace` /
-        // `OrchestratorThread.listenTrace`.
+        // gate + the normal buffering path.
         if event == "trace" {
-            emitThreadEvent("trace", content, mutablePayload["thread_id"] as? String)
+            emitThreadEvent("trace", content, threadId)
             return
         }
 
@@ -303,44 +385,44 @@ public final class Subscription: BaseSubscription {
 
         // Thread-scoped events route on `"<threadId>-<event>"` keys; flat
         // events keep the plain `event` / `"all"` keys.
-        let threadId = mutablePayload["thread_id"] as? String
         let hasThread = (threadId?.isEmpty == false)
         let eventKey = hasThread ? "\(threadId!)-\(event)" : event
         let allKey   = hasThread ? "\(threadId!)-all"      : "all"
 
-        let hasSpecific = emitter.listenerCount(eventKey) > 0
-        let hasAll      = emitter.listenerCount(allKey) > 0
-
-        if hasSpecific || hasAll {
-
-            if hasSpecific { emitThreadEvent(event, content, threadId) }
-
-            if hasAll {
-                emitThreadEvent("all", [
-                    "event":   event,
-                    "content": content
-                ], threadId)
+        // Check-or-buffer atomically with listener registration so a frame
+        // can't fall between a drain and an attach.
+        let (hasSpecific, hasAll) = stateLock.sync { () -> (Bool, Bool) in
+            let specific = emitter.listenerCount(eventKey) > 0
+            let all = emitter.listenerCount(allKey) > 0
+            if !specific && !all {
+                // Buffer for later — `thread_id` is copied so the buffer
+                // router can replay into the right per-thread queue.
+                let keys = [
+                    "id", "from", "channel", "to",
+                    "pipeline_id", "thread_id", "attempt_id",
+                    "interceptor_name", "to_username"
+                ]
+                var entry: [String: Any] = ["content": content]
+                keys.forEach {
+                    if let v = mutablePayload[$0] { entry[$0] = v }
+                }
+                bufferEventLocked(event, entry)
             }
-
-            acknowledge(mutablePayload, "CA")
-
-        } else {
-
-            // Buffer for later — `thread_id` is copied so the buffer router
-            // can replay into the right per-thread queue.
-            let keys = [
-                "id", "from", "channel", "to",
-                "pipeline_id", "thread_id", "attempt_id",
-                "interceptor_name", "to_username"
-            ]
-
-            var entry: [String: Any] = ["content": content]
-            keys.forEach {
-                if let v = mutablePayload[$0] { entry[$0] = v }
-            }
-
-            bufferEvent(event, entry)
+            return (specific, all)
         }
+
+        guard hasSpecific || hasAll else { return }
+
+        if hasSpecific { emitThreadEvent(event, content, threadId) }
+
+        if hasAll {
+            emitThreadEvent("all", [
+                "event":   event,
+                "content": content
+            ], threadId)
+        }
+
+        acknowledge(mutablePayload, "CA")
     }
 
     // MARK: - Human-in-the-loop reply
@@ -348,8 +430,7 @@ public final class Subscription: BaseSubscription {
     // Sends a `return_flag: "HF"` frame answering a `human_input_request`,
     // echoing the routing/correlation fields (incl. `root_workflow_id`) from
     // the original request. Invoked via the `reply` closure injected into
-    // content in `handleMessage`. Mirrors js-adk-common subscription.ts
-    // `sendHumanFeedback`.
+    // content in `handleMessage`.
     private func sendHumanFeedback(originalReq: [String: Any], replyData: Any) {
         let conn = websocketHandler.getConnection()
         var reply: [String: Any] = [
@@ -365,24 +446,22 @@ public final class Subscription: BaseSubscription {
             if let v = originalReq[key] { reply[key] = v }
         }
 
-        // Reply is routed back to the original sender.
-        if let from = originalReq["from"] {
+        // Reply is routed back to the original sender, if any.
+        if ArtJSON.isTruthy(originalReq["from"]), let from = originalReq["from"] {
             reply["to"] = [from]
-        }
-
-        // Reply payload is JSON-encoded into `content` (mirrors JSON.stringify).
-        if JSONSerialization.isValidJSONObject(replyData),
-           let data = try? JSONSerialization.data(withJSONObject: replyData),
-           let str = String(data: data, encoding: .utf8) {
-            reply["content"] = str
-        } else if let str = replyData as? String {
-            reply["content"] = str
         } else {
-            reply["content"] = "\(replyData)"
+            reply["to"] = [String]()
         }
 
-        if let msgData = try? JSONSerialization.data(withJSONObject: reply),
-           let msgStr = String(data: msgData, encoding: .utf8) {
+        // Reply payload is JSON-encoded — strings are quoted.
+        do {
+            reply["content"] = try ArtJSON.stringify(replyData)
+        } catch {
+            ArtLog.error("HITL reply is not JSON-serializable: \(error)")
+            return
+        }
+
+        if let msgStr = try? ArtJSON.stringify(reply) {
             _ = websocketHandler.sendMessage(msgStr)
         }
     }

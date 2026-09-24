@@ -6,23 +6,31 @@ import Foundation
 public struct AdkConfig: Encodable {
     public var uri: String
     public var authToken: String?
+    /// Swift-specific credential hook, re-read on every authentication.
+    /// Takes precedence over `Adk.setCredentials(_:)` and
+    /// `autoLoadCredsFromJSON`.
     public var getCredentials: (() -> CredentialStore)?
+    /// Directory containing `adk-services.json`. When
+    /// `nil`, the file is looked up in the app bundle.
     public var root: String?
+    /// Load credentials from `adk-services.json` on `connect()`.
+    public var autoLoadCredsFromJSON: Bool
 
     public init(
         uri: String,
         authToken: String? = nil,
         getCredentials: (() -> CredentialStore)? = nil,
-        root: String? = nil
+        root: String? = nil,
+        autoLoadCredsFromJSON: Bool = false
     ) {
         self.uri = uri
         self.authToken = authToken
         self.getCredentials = getCredentials
         self.root = root
+        self.autoLoadCredsFromJSON = autoLoadCredsFromJSON
     }
-    
     enum CodingKeys: String, CodingKey {
-            case uri, authToken, root
+            case uri, authToken, root, autoLoadCredsFromJSON
         }
 }
 
