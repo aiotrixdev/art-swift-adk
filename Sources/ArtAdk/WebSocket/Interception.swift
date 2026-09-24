@@ -50,8 +50,7 @@ public final class Interception {
         response["pipeline_id"]      = pipelineId
         response["interceptor_name"] = interceptorName
         response["attempt_id"]       = attemptId
-        response["content"]          = (try? JSONSerialization.data(withJSONObject: content))
-            .flatMap { String(data: $0, encoding: .utf8) } ?? ""
+        response["content"]          = (try? ArtJSON.stringify(content)) ?? ""
         return response
     }
 
@@ -79,35 +78,44 @@ public final class Interception {
         // Forward agentic routing metadata so the server can correlate
         // intercepted frames on agent/orchestrator channels. Flows through
         // createResponse (which copies `config`) into the resolve/reject
-        // response. Mirrors js-adk-common interception.ts (ea09149 + 7f3133a).
+        // response.
         for k in ["to_username", "thread_id", "node_id", "agent_node_id",
                   "agent_id", "environment_id", "configuration_id", "root_workflow_id"] {
             if let v = request[k] { config[k] = v }
         }
 
+        // Accept a JSON object or array. An object that
+        // echoes the envelope (`attempt_id` / `pipeline_id`) is unwrapped to
+        // its `data`; an array is sent as-is.
         let resolve: (Any) -> Void = { [weak self] data in
             guard let self else { return }
-            guard let dataDict = data as? [String: Any] ?? (data as? [[String: Any]]).map({ ["items": $0] }) else {
+            let content: Any
+            if let dict = data as? [String: Any] {
+                if dict["attempt_id"] != nil || dict["pipeline_id"] != nil {
+                    content = dict["data"] ?? [String: Any]()
+                } else {
+                    content = dict
+                }
+            } else if let array = data as? [Any] {
+                content = array
+            } else {
+                ArtLog.error("Invalid data: Expected a JSON object or array of objects.")
                 return
-            }
-            var sanitized = dataDict
-            if sanitized["attempt_id"] != nil || sanitized["pipeline_id"] != nil {
-                sanitized = sanitized["data"] as? [String: Any] ?? [:]
             }
             let response = self.createResponse(
                 config: config, id: id, refId: refId,
                 channel: channel, namespace: namespace_,
                 event: event, pipelineId: pipelineId,
                 interceptorName: interceptorName, attemptId: attemptId,
-                type: "resolve", content: sanitized
+                type: "resolve", content: content
             )
             self.sendJSON(response)
         }
 
         let reject: (String) -> Void = { [weak self] error in
             guard let self else { return }
-            let raw = request["data"]
-            let errResponse: [String: Any] = ["rawData": raw as Any, "error": error]
+            let raw = request["data"] ?? NSNull()
+            let errResponse: [String: Any] = ["rawData": raw, "error": error]
             let response = self.createResponse(
                 config: config, id: id, refId: refId,
                 channel: channel, namespace: namespace_,
@@ -125,8 +133,7 @@ public final class Interception {
     private func acknowledge(_ request: [String: Any]) {
         var response: [String: Any] = ["return_flag": "IA"]
         // Echo agentic routing metadata on the IA acknowledge so the server
-        // can correlate the intercepted frame. Mirrors js-adk-common
-        // interception.ts acknowledge (ea09149 + 7f3133a).
+        // can correlate the intercepted frame.
         ["channel", "namespace", "id", "ref_id", "from", "to", "to_username",
          "pipeline_id", "interceptor_name", "attempt_id",
          "thread_id", "node_id", "agent_node_id", "agent_id",
@@ -134,8 +141,7 @@ public final class Interception {
             if let v = request[k] { response[k] = v }
         }
         if let data = request["data"] {
-            response["content"] = (try? JSONSerialization.data(withJSONObject: data))
-                .flatMap { String(data: $0, encoding: .utf8) } ?? ""
+            response["content"] = (try? ArtJSON.stringify(data)) ?? ""
         }
         sendJSON(response)
     }
@@ -143,17 +149,17 @@ public final class Interception {
     // MARK: - handleMessage (called by Socket)
     public func handleMessage(channel: String, data: [String: Any]) async {
         var mutable = data
-        if let dataStr = data["data"] as? String,
-           let parsed = dataStr.data(using: .utf8).flatMap({ try? JSONSerialization.jsonObject(with: $0) }) {
+        if let dataStr = data["data"] as? String, let parsed = ArtJSON.parse(dataStr) {
             mutable["data"] = parsed
         }
         execute(request: mutable)
     }
 
     private func sendJSON(_ dict: [String: Any]) {
-        if let data = try? JSONSerialization.data(withJSONObject: dict),
-           let str  = String(data: data, encoding: .utf8) {
-            _ = websocketHandler.sendMessage(str)
+        do {
+            _ = websocketHandler.sendMessage(try ArtJSON.stringify(dict))
+        } catch {
+            ArtLog.error("Interceptor response is not JSON-serializable: \(error)")
         }
     }
 }

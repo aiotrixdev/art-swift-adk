@@ -6,7 +6,7 @@ import Foundation
 // MARK: - CRDTListener
 public typealias CRDTListener = (Any) -> Void
 
-// MARK: - CRDTProxy  (@dynamicMemberLookup  ≈ JS Proxy)
+// MARK: - CRDTProxy  (@dynamicMemberLookup)
 @dynamicMemberLookup
 public final class CRDTProxy {
     internal let crdt: CRDT
