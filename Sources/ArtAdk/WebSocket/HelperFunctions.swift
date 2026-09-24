@@ -39,16 +39,14 @@ public func subscribe_to_channel(
     let channelName      = data["channel"]        as? String ?? channel
     let channelNamespace = data["channelNamespace"] as? String ?? ""
     let subscriptionID   = data["subscriptionID"]  as? String
-    
-
-
     return ChannelConfig(
         channelName:      channelName,
         channelNamespace: channelNamespace,
         channelType:      rawData["TypeofChannel"] as? String ?? "default",
         presenceUsers:    presenceUsers,
         snapshot:         snapshot,
-        subscriptionID:   subscriptionID
+        subscriptionID:   subscriptionID,
+        orchestratorEnabled: (rawData["IsInterceptorEnabled"] as? NSNumber)?.boolValue ?? false
     )
 }
 

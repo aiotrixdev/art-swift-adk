@@ -30,6 +30,10 @@ xcuserdata/
 Packages/
 *.resolved
 
+# Unit tests stay local (Package.swift declares the test target only when
+# this folder exists)
+/Tests/
+
 # Secrets / Environment
 .env
 .env.*

@@ -1,4 +1,6 @@
 // Sources/ARTSdk/WebSocket/BaseSubscription.swift
+//
+// Channel subscription base.
 
 import Foundation
 
@@ -8,21 +10,111 @@ private struct PendingAck {
     let timer: Task<Void, Never>
 }
 
+// MARK: - Inbound queue element
+private struct InboundMessage: @unchecked Sendable {
+    let event: String
+    let payload: [String: Any]
+}
+
+// MARK: - EventBuffer
+/// Insertion-ordered per-event buffer: replay walks events in
+/// first-arrival order, then messages in arrival order.
+struct EventBuffer {
+    private(set) var order: [String] = []
+    private(set) var items: [String: [[String: Any]]] = [:]
+
+    init() {}
+
+    init(_ dictionary: [String: [[String: Any]]]) {
+        for key in dictionary.keys.sorted() {
+            order.append(key)
+            items[key] = dictionary[key]
+        }
+    }
+
+    var isEmpty: Bool { order.isEmpty }
+    var dictionary: [String: [[String: Any]]] { items }
+
+    mutating func append(_ event: String, _ entry: [String: Any]) {
+        if items[event] == nil { order.append(event) }
+        items[event, default: []].append(entry)
+    }
+
+    /// Removes and returns the entries buffered for `event`.
+    mutating func take(_ event: String) -> [[String: Any]] {
+        guard let entries = items.removeValue(forKey: event) else { return [] }
+        order.removeAll { $0 == event }
+        return entries
+    }
+
+    /// Removes and returns every entry in replay order.
+    mutating func drainAll() -> [(event: String, entry: [String: Any])] {
+        let drained = order.flatMap { event in
+            (items[event] ?? []).map { (event: event, entry: $0) }
+        }
+        order.removeAll()
+        items.removeAll()
+        return drained
+    }
+}
+
 // MARK: - BaseSubscription
 open class BaseSubscription {
 
+    /// Channels handled locally, without a `channel-subscribe` round trip.
+    static let reservedChannels: Set<String> = ["art_config", "art_secure"]
+    /// Channels that never take part in ACKs / ref tracking.
+    static let controlChannels: Set<String> = ["art_config", "art_secure", "art_presence"]
+
     public let connectionID: String
-    public var isSubscribed: Bool = false
-    public var isListening: Bool = false
     public let websocketHandler: IWebsocketHandler
-    public var channelConfig: ChannelConfig
-    public var messageBuffer: [String: [[String: Any]]] = [:]
-    public var presenceUsers: [String] = []
     public let emitter = EventEmitter()
 
+    /// Guards the mutable state below (shared with `Subscription`).
+    let stateLock = ArtLock()
+    private var _isSubscribed = false
+    private var _isListening = false
+    private var _channelConfig: ChannelConfig
+    private var _presenceUsers: [String]
+    /// Non-thread events buffered until a listener attaches.
+    var bufferStorage = EventBuffer()
+
     private var pendingAcks: [String: PendingAck] = [:]
-    private let ackTimeout: Double = 50_000
+    /// How long `push` waits for the server `SA` ACK on targeted channels,
+    /// in milliseconds.
+    var ackTimeoutMs: Double = 50_000
     private var messageCount: Int = 0
+
+    // In-order inbound delivery (see `enqueue`).
+    private let inboundStream: AsyncStream<InboundMessage>
+    private let inboundContinuation: AsyncStream<InboundMessage>.Continuation
+    private var inboundTask: Task<Void, Never>?
+
+    public var isSubscribed: Bool {
+        get { stateLock.sync { _isSubscribed } }
+        set { stateLock.sync { _isSubscribed = newValue } }
+    }
+
+    public var isListening: Bool {
+        get { stateLock.sync { _isListening } }
+        set { stateLock.sync { _isListening = newValue } }
+    }
+
+    public var channelConfig: ChannelConfig {
+        get { stateLock.sync { _channelConfig } }
+        set { stateLock.sync { _channelConfig = newValue } }
+    }
+
+    public var presenceUsers: [String] {
+        get { stateLock.sync { _presenceUsers } }
+        set { stateLock.sync { _presenceUsers = newValue } }
+    }
+
+    /// Snapshot of buffered non-thread events, keyed by event name.
+    public var messageBuffer: [String: [[String: Any]]] {
+        get { stateLock.sync { bufferStorage.dictionary } }
+        set { stateLock.sync { bufferStorage = EventBuffer(newValue) } }
+    }
 
     public init(
         connectionID: String,
@@ -32,43 +124,67 @@ open class BaseSubscription {
     ) {
         self.connectionID = connectionID
         self.websocketHandler = websocketHandler
-        self.channelConfig = channelConfig
-        self.presenceUsers = channelConfig.presenceUsers
+        self._channelConfig = channelConfig
+        self._presenceUsers = channelConfig.presenceUsers
 
-        if process == "subscribe" { isSubscribed = true }
-        else if process == "presence" { isListening = true }
+        var continuation: AsyncStream<InboundMessage>.Continuation!
+        self.inboundStream = AsyncStream { continuation = $0 }
+        self.inboundContinuation = continuation
+
+        if process == "subscribe" { _isSubscribed = true }
+        else if process == "presence" { _isListening = true }
+
+        // Single consumer: frames for this subscription are handled one at a
+        // time in arrival order. `handleMessage` dispatches to the subclass
+        // override.
+        let stream = inboundStream
+        inboundTask = Task { [weak self] in
+            for await message in stream {
+                guard let self else { return }
+                await self.handleMessage(event: message.event, payload: message.payload)
+            }
+        }
+    }
+
+    deinit {
+        inboundContinuation.finish()
+        inboundTask?.cancel()
+    }
+
+    // MARK: - Inbound queue
+    /// Queues an inbound frame for in-order delivery to `handleMessage`.
+    /// Lock-free, so the socket may call it while holding its own lock.
+    func enqueue(event: String, payload: [String: Any]) {
+        inboundContinuation.yield(InboundMessage(event: event, payload: payload))
     }
 
     // MARK: - Validate subscription
     public func validateSubscription(process: String) async {
 
-        guard !["art_config", "art_secure"].contains(channelConfig.channelName) else { return }
+        let config = channelConfig
+        guard !["art_config", "art_secure"].contains(config.channelName) else { return }
 
-        var channelName = channelConfig.channelName
+        var channelName = config.channelName
 
-        if !channelConfig.channelNamespace.isEmpty {
-            channelName += ":\(channelConfig.channelNamespace)"
+        if !config.channelNamespace.isEmpty {
+            channelName += ":\(config.channelNamespace)"
         }
 
         do {
-
-            let config = try await subscribe_to_channel(
+            let fresh = try await subscribe_to_channel(
                 channel: channelName,
                 process: process,
                 websocketHandler: websocketHandler
             )
-
-            channelConfig = config
-
+            channelConfig = fresh
             if process == "presence" {
                 isListening = true
             }
-
         } catch {
-return
+            ArtLog.error("validateSubscription(\(process)) failed for \(channelName): \(error)")
         }
     }
-    
+
     // MARK: - Presence
     public func fetchPresence(
         unique: Bool = true,
@@ -89,10 +205,11 @@ return
 
         emitter.on("art_presence") { [weak self] payload in
 
+            // Any truthy `error` suppresses the update.
             guard let self,
                   let data = payload as? [String: Any],
-                  let usernames = data["usernames"] as? [String],
-                  (data["error"] as? Bool ?? false) == false else { return }
+                  !ArtJSON.isTruthy(data["error"]),
+                  let usernames = data["usernames"] as? [String] else { return }
 
             self.presenceUsers = usernames
 
@@ -123,25 +240,28 @@ return
         )
 
         return {
-
+            let config = self.channelConfig
             _ = try await unsubscribe_from_channel(
-                channel: self.channelConfig.channelName,
-                subscriptionID: self.channelConfig.subscriptionID ?? "",
+                channel: config.channelName,
+                subscriptionID: config.subscriptionID ?? "",
                 process: "presence",
                 websocketHandler: self.websocketHandler
             )
         }
     }
-    
-    
+
+
     // MARK: - ACK
+    /// Sends a delivery acknowledgement (`MA` / `CA`) for targeted and
+    /// secure channels.
     public func acknowledge(_ request: [String: Any], _ returnFlag: String) {
 
-        guard channelConfig.channelType == "targeted" ||
-              channelConfig.channelType == "secure" else { return }
+        let config = channelConfig
+        guard config.channelType == "targeted" ||
+              config.channelType == "secure" else { return }
 
         guard let channel = request["channel"] as? String,
-              !["art_config", "art_secure", "art_presence"].contains(channel) else { return }
+              !BaseSubscription.controlChannels.contains(channel) else { return }
 
         var response: [String: Any] = [
             "channel": channel,
@@ -149,6 +269,7 @@ return
         ]
 
         let keys = [
+            "namespace",
             "id",
             "ref_id",
             "from",
@@ -165,14 +286,13 @@ return
             }
         }
 
-        if let data = try? JSONSerialization.data(withJSONObject: response),
-           let str = String(data: data, encoding: .utf8) {
-
+        if let str = try? ArtJSON.stringify(response) {
             _ = websocketHandler.sendMessage(str)
         }
     }
 
     // MARK: - Handle ACK
+    /// Resolves the pending `push` whose `ref_id` matches a server `SA`.
     public func handleMessageAcks(
         event: String,
         returnFlag: String,
@@ -182,19 +302,21 @@ return
         guard returnFlag == "SA",
               let refId = data["ref_id"] as? String else { return }
 
-        if let ack = pendingAcks[refId] {
-
-            ack.timer.cancel()
-            ack.continuation.resume(returning: refId)
-
-            pendingAcks.removeValue(forKey: refId)
-        }
+        let entry = stateLock.sync { pendingAcks.removeValue(forKey: refId) }
+        guard let entry else { return }
+        entry.timer.cancel()
+        entry.continuation.resume(returning: refId)
     }
-    
+
+    private func failPendingAck(_ refId: String, _ error: Error) {
+        let entry = stateLock.sync { pendingAcks.removeValue(forKey: refId) }
+        entry?.continuation.resume(throwing: error)
+    }
+
     // MARK: - Subscribe
     public func subscribe() async {
 
-        guard !["art_config", "art_secure"].contains(channelConfig.channelName) else {
+        guard !BaseSubscription.reservedChannels.contains(channelConfig.channelName) else {
             return
         }
 
@@ -211,39 +333,44 @@ return
             channelConfig = config
 
         } catch {
+            ArtLog.error("subscribe failed for \(channelConfig.channelName): \(error)")
             isSubscribed = false
         }
     }
-    
+
     // MARK: - Unsubscribe
     public func unsubscribe() async {
 
-        guard let subID = channelConfig.subscriptionID else { return }
+        let config = channelConfig
+        guard let subID = config.subscriptionID, !subID.isEmpty else { return }
 
         do {
 
             let ok = try await unsubscribe_from_channel(
-                channel: channelConfig.channelName,
+                channel: config.channelName,
                 subscriptionID: subID,
                 process: "subscribe",
                 websocketHandler: websocketHandler
             )
 
             if ok {
-                websocketHandler.removeSubscription(channel: channelConfig.channelName)
+                websocketHandler.removeSubscription(channel: config.channelName)
+            } else {
+                ArtLog.error("Failed to unsubscribe from channel \(config.channelName)")
             }
 
         } catch {
-            return
+            ArtLog.error("Failed to unsubscribe from channel \(config.channelName): \(error)")
         }
     }
-    
-    
+
+
     // MARK: - Reconnect
     public func reconnect() {
 
-        guard channelConfig.channelName != "art_config",
-              channelConfig.channelName != "art_secure" else { return }
+        let name = channelConfig.channelName
+        guard name != "art_config",
+              name != "art_secure" else { return }
 
         Task {
             if isListening {
@@ -253,18 +380,30 @@ return
             await subscribe()
         }
     }
-    
-    
+
+
     // MARK: - Push
     /// Sends an event on this channel. Returns the SDK-generated `ref_id`
-    /// (or `nil` for control channels that are not ref-tracked) so callers
-    /// such as `AgentThread.run` can correlate the originating message.
+    /// (or `nil` for control channels, which are not ref-tracked).
+    ///
+    /// On **targeted** channels the call waits for the server's `SA`
+    /// acknowledgement and throws `ARTError.ackTimeout` after 50 s.
     @discardableResult
     public func push(
         event: String,
         data: [String: Any],
         options: PushConfig? = nil
     ) async throws -> String? {
+        try await sendFrame(event: event, content: data, options: options)
+    }
+
+    /// Sends a JSON array payload (used for CRDT `merge` batches).
+    public func pushArray(event: String, data: [[String: Any]]) async throws {
+        _ = try await sendFrame(event: event, content: data, options: nil)
+    }
+
+    /// Builds and sends a push frame for any JSON-compatible content.
+    func sendFrame(event: String, content: Any, options: PushConfig?) async throws -> String? {
 
         await websocketHandler.wait()
 
@@ -272,33 +411,33 @@ return
             throw ARTError.notConnected
         }
 
+        let config = channelConfig
         let to = options?.to ?? []
-    
-        let jsonData = try JSONSerialization.data(withJSONObject: data)
-        var messageStr = String(data: jsonData, encoding: .utf8) ?? "{}"
+        var messageStr = try ArtJSON.stringify(content)
 
         // Targeted / secure validation
-        if channelConfig.channelType == "secure" || channelConfig.channelType == "targeted" {
+        if config.channelType == "secure" || config.channelType == "targeted" {
             if to.count != 1 && event != "art_presence" {
-                throw ARTError.serverError("Exactly one user must be specified for targeted/secure channel")
+                throw ARTError.serverError("Exactly one user must be specified for sending message.")
             }
         }
-        
 
-        if channelConfig.channelType == "secure" && event != "art_presence" {
+        if config.channelType == "secure" && event != "art_presence" {
 
             guard let secureResult = try await websocketHandler.pushForSecureLine(
                 event: "secured_public_key",
                 data: ["username": to[0]],
                 listen: true
             ) as? [String: Any],
-            let inner = secureResult["data"] as? [String: Any],
-            let pubKey = inner["public_key"] as? String else {
+            let inner = secureResult["data"] as? [String: Any] else {
                 throw ARTError.encryptionError("Could not fetch public key")
             }
 
             if inner["status"] as? String == "unsuccessfull" {
                 throw ARTError.encryptionError(inner["error"] as? String ?? "Unknown error")
+            }
+            guard let pubKey = inner["public_key"] as? String else {
+                throw ARTError.encryptionError("Could not fetch public key")
             }
 
             messageStr = try await websocketHandler.encrypt(
@@ -308,66 +447,57 @@ return
         }
 
         var refId: String?
+        var awaitsAck = false
 
-        if !["art_config","art_secure","art_presence"].contains(channelConfig.channelName) {
-            messageCount += 1
-            refId = "\(connection.connectionId)_\(channelConfig.channelName)_\(messageCount)"
+        if !BaseSubscription.controlChannels.contains(config.channelName) {
+            let count = stateLock.sync { () -> Int in
+                messageCount += 1
+                return messageCount
+            }
+            refId = "\(connection.connectionId)_\(config.channelName)_\(count)"
+            // Note: this compares the channel *name* with "secure", so in
+            // practice only targeted channels wait for the SA acknowledgement.
+            awaitsAck = config.channelType == "targeted" || config.channelName == "secure"
         }
 
         var message: [String: Any] = [
             "from": connection.connectionId,
             "to": to,
-            "channel": channelConfig.channelName +
-                       (channelConfig.channelNamespace.isEmpty ? "" : ":\(channelConfig.channelNamespace)"),
+            "channel": config.channelName +
+                       (config.channelNamespace.isEmpty ? "" : ":\(config.channelNamespace)"),
             "event": event,
-            "content": messageStr
+            "content": messageStr,
+            // Always sent; `null` when there is no thread.
+            "thread_id": options?.threadID.map { $0 as Any } ?? NSNull()
         ]
 
         if let refId {
             message["ref_id"] = refId
         }
 
-        // Thread-scoped pushes (OrchestratorThread) carry the thread id at
-        // the top level so the server and thread listeners can correlate.
-        if let threadID = options?.threadID, !threadID.isEmpty {
-            message["thread_id"] = threadID
+        if let fileMeta = options?.fileMeta, !fileMeta.isEmpty {
+            message["file_meta"] = fileMeta.map { $0.jsonObject }
         }
 
-        if let msgData = try? JSONSerialization.data(withJSONObject: message),
-           let msgStr = String(data: msgData, encoding: .utf8) {
-            _ = websocketHandler.sendMessage(msgStr)
+        let frame = try ArtJSON.stringify(message)
+
+        guard awaitsAck, let refId else {
+            _ = websocketHandler.sendMessage(frame)
+            return refId
         }
 
-        return refId
-    }
-
-    public func pushArray(event: String, data: [[String: Any]]) async throws {
-
-        await websocketHandler.wait()
-
-        guard let connection = websocketHandler.getConnection() else {
-            throw ARTError.notConnected
-        }
-
-        let jsonData = try JSONSerialization.data(withJSONObject: data)
-        let messageStr = String(data: jsonData, encoding: .utf8) ?? "[]"
-
-        messageCount += 1
-        let refId = "\(connection.connectionId)_\(channelConfig.channelName)_\(messageCount)"
-
-        let message: [String: Any] = [
-            "from": connection.connectionId,
-            "to": [],
-            "channel": channelConfig.channelName +
-                       (channelConfig.channelNamespace.isEmpty ? "" : ":\(channelConfig.channelNamespace)"),
-            "event": event,
-            "content": messageStr,
-            "ref_id": refId
-        ]
-
-        if let msgData = try? JSONSerialization.data(withJSONObject: message),
-           let msgStr = String(data: msgData, encoding: .utf8) {
-            _ = websocketHandler.sendMessage(msgStr)
+        // Register the ACK before sending so a fast `SA` can't be missed.
+        let timeoutNs = UInt64(ackTimeoutMs * 1_000_000)
+        return try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<String, Error>) in
+            let timer = Task {
+                try? await Task.sleep(nanoseconds: timeoutNs)
+                guard !Task.isCancelled else { return }
+                self.failPendingAck(refId, ARTError.ackTimeout)
+            }
+            stateLock.sync {
+                pendingAcks[refId] = PendingAck(continuation: continuation, timer: timer)
+            }
+            _ = websocketHandler.sendMessage(frame)
         }
     }
 

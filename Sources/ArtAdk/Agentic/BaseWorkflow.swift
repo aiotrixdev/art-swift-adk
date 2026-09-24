@@ -5,9 +5,7 @@
 // dedicated server-side channel.
 //
 // Concentrates the lazy-idempotent subscribe pattern in one place:
-// subclasses only need to override `channelName`. Mirrors
-// `js-adk-common/agentic/BaseWorkflow.ts` and the Flutter
-// `lib/src/agentic/base_workflow.dart`.
+// subclasses only need to override `channelName`.
 
 import Foundation
 
