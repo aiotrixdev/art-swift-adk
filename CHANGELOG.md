@@ -26,7 +26,7 @@ All notable changes to the ART Swift ADK are documented in this file.
 - Answers sent through the `reply` closure of a request for human input are encoded as JSON, so text answers arrive in quotes.
 - An interceptor that resolves with an array now sends the array unchanged.
 - `adk-services.json` is now loaded from the app bundle.
-- The `art_notifications` channel is now subscribed on the server, as the Flutter SDK does. It's a broadcast channel, so notifications sent to subscribers now reach `onNew`.
+- The `art_notifications` channel is now subscribed on the server. It's a broadcast channel, so notifications sent to subscribers now reach `onNew`.
 
 ### Fixed
 
