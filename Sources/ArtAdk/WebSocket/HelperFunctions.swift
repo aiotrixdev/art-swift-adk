@@ -8,7 +8,7 @@ public func subscribe_to_channel(
     process: String,
     websocketHandler: IWebsocketHandler
 ) async throws -> ChannelConfig {
-    await websocketHandler.wait()
+    try await websocketHandler.wait()
 
     let subscriptionChannelName = process == "subscribe" ? "channel-subscribe" : "channel-presence"
 
@@ -26,12 +26,11 @@ public func subscribe_to_channel(
     }
 
     if let status = data["status"] as? String, status == "not-OK" {
-        let errMsg = data["error"] as? String ?? "Unknown error"
-        throw ARTError.serverError(errMsg)
+        throw ARTError.serverError(rejection(data, "The channel subscription was rejected."))
     }
 
     guard let rawData = data["channelConfig"] as? [String: Any] else {
-        throw ARTError.channelNotFound(channel)
+        throw ARTError.serverError("The server did not return a channel configuration.")
     }
 
     let snapshot = data["snapshot"]
@@ -46,8 +45,15 @@ public func subscribe_to_channel(
         presenceUsers:    presenceUsers,
         snapshot:         snapshot,
         subscriptionID:   subscriptionID,
-        orchestratorEnabled: (rawData["IsInterceptorEnabled"] as? NSNumber)?.boolValue ?? false
+        orchestratorEnabled: (rawData["IsInterceptorEnabled"] as? NSNumber)?.boolValue ?? false,
+        configurationID:  ArtJSON.string(data["configurationID"])
     )
+}
+
+/// The server's `error` text, else `fallback`.
+private func rejection(_ data: [String: Any], _ fallback: String) -> String {
+    let error = data["error"] as? String ?? ""
+    return error.isEmpty ? fallback : error
 }
 
 // MARK: - unsubscribe_from_channel
@@ -57,7 +63,7 @@ public func unsubscribe_from_channel(
     process: String,
     websocketHandler: IWebsocketHandler
 ) async throws -> Bool {
-    await websocketHandler.wait()
+    try await websocketHandler.wait()
 
     let channelName = process == "subscribe" ? "channel-unsubscribe" : "presence-unsubscribe"
 
@@ -71,8 +77,7 @@ public func unsubscribe_from_channel(
           let data = wrapper["data"] as? [String: Any] else { return false }
 
     if let status = data["status"] as? String, status == "not-OK" {
-        let errMsg = data["error"] as? String ?? "Unknown error"
-        throw ARTError.serverError(errMsg)
+        throw ARTError.serverError(rejection(data, "The channel request was rejected."))
     }
 
     return true
@@ -83,7 +88,7 @@ public func get_interceptor_config(
     interceptor: String,
     websocketHandler: IWebsocketHandler
 ) async throws -> Any? {
-    await websocketHandler.wait()
+    try await websocketHandler.wait()
 
     guard let result = try await websocketHandler.pushForSecureLine(
         event: "interceptor-subscribe",
@@ -95,8 +100,7 @@ public func get_interceptor_config(
           let data = wrapper["data"] as? [String: Any] else { return nil }
 
     if let status = data["status"] as? String, status == "not-OK" {
-        let errMsg = data["error"] as? String ?? "Unknown error"
-        throw ARTError.serverError(errMsg)
+        throw ARTError.serverError(rejection(data, "The interceptor subscription was rejected."))
     }
 
     return data["interceptorConfig"]

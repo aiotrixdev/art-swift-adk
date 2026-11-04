@@ -15,7 +15,7 @@ import Foundation
 /// Typical use:
 ///
 /// ```swift
-/// let agent = adk.agent("my-agent")
+/// let agent = try adk.agent("my-agent")
 /// let thread = agent.thread()
 /// await thread.listen { event in print("event: \(event.event)") }
 /// let run = try await thread.run("plan my trip")
@@ -23,12 +23,17 @@ import Foundation
 /// ```
 public final class Agent: BaseWorkflow {
 
-    /// The server-side identifier for the agent. Used to compute the
+    /// The agent's slug, optionally with `@buildname`. Used to compute the
     /// channel name `agent_com_<agentId>`.
     public let agentId: String
 
     /// Creates an `Agent` bound to `socket`.
-    public init(_ agentId: String, socket: Socket) {
+    ///
+    /// `agentId` is the agent's slug, optionally pinned to a named build
+    /// (`my-agent@release2`). Throws `ARTError.invalidArgument` for anything
+    /// else; see `validateExecutionReference(_:)`.
+    public init(_ agentId: String, socket: Socket) throws {
+        try validateExecutionReference(agentId)
         self.agentId = agentId
         super.init(socket: socket)
     }
@@ -39,14 +44,27 @@ public final class Agent: BaseWorkflow {
         AgentThread(agent: self, threadId: threadId)
     }
 
+    /// Calls `listener` when the connection fails, so `AgentThread` can end
+    /// its active run. Returns an id for `offConnectionFailure(_:)`.
+    @discardableResult
+    func onConnectionFailure(_ listener: @escaping (ConnectionError) -> Void) -> UUID {
+        socket.onConnectionFailure(listener)
+    }
+
+    /// Removes a listener added with `onConnectionFailure(_:)`.
+    func offConnectionFailure(_ id: UUID) {
+        socket.offConnectionFailure(id)
+    }
+
     // MARK: - Storage (agent-scoped)
 
-    /// Uploads a local file, scoped to this agent: `configId` is always
-    /// set to `agentId`, whatever `options` contains.
+    /// Uploads a local file owned by this agent's channel configuration,
+    /// whatever `options.configId` contains. `options.threadId` is required;
+    /// `AgentThread.upload` sets it.
     @discardableResult
     public func upload(fileURL: URL, options: UploadOptions = UploadOptions()) async throws -> FileRef {
         var opts = options
-        opts.configId = agentId
+        opts.configId = try await getSubscription().configurationId
         return try await Storage().upload(fileURL: fileURL, options: opts)
     }
 
@@ -60,14 +78,15 @@ public final class Agent: BaseWorkflow {
         options: UploadOptions = UploadOptions()
     ) async throws -> FileRef {
         var opts = options
-        opts.configId = agentId
+        opts.configId = try await getSubscription().configurationId
         return try await Storage().upload(data: data, filename: filename, contentType: contentType, options: opts)
     }
 
-    /// Lists files scoped to this agent's `agentId`.
+    /// Lists the files this agent's channel configuration can access in
+    /// `options.threadId` (required; `AgentThread.listFiles` sets it).
     public func listFiles(options: ListOptions = ListOptions()) async throws -> StorageFileList {
         var opts = options
-        opts.configId = agentId
+        opts.configId = try await getSubscription().configurationId
         return try await Storage().listFiles(options: opts)
     }
 }
