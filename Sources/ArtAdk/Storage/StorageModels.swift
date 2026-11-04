@@ -5,15 +5,14 @@
 //  Created by SSA on 20/07/26.
 //
 //  Storage models: `ConfigType`, `FileRef`, `StorageFile` and the
-//  `file_meta` entry shape.
+//  `file_meta` entry shape (`MediaRef`).
 //
 
 import Foundation
 
 // MARK: - ConfigType
 
-/// Storage group type (`config_type`), e.g. `media` or `knowledge_base`.
-/// Extensible — any server value can be expressed as a string literal.
+/// Storage file category (`config_type`). Only `media` is supported.
 public struct ConfigType: RawRepresentable, Hashable, Sendable, ExpressibleByStringLiteral {
     public let rawValue: String
 
@@ -21,6 +20,7 @@ public struct ConfigType: RawRepresentable, Hashable, Sendable, ExpressibleByStr
     public init(stringLiteral value: String) { self.rawValue = value }
 
     public static let media = ConfigType(rawValue: "media")
+    @available(*, deprecated, message: "Storage only holds media files.")
     public static let knowledgeBase = ConfigType(rawValue: "knowledge_base")
 }
 
@@ -97,26 +97,39 @@ public struct StorageFileList: Hashable, Sendable {
     }
 }
 
-// MARK: - FileMeta
+// MARK: - MediaRef
 
-/// An uploaded file attached to a message, sent as an entry of the frame's
-/// top-level `file_meta` array (`{ "id": ..., "scope": [...] }`).
+/// A file an agent request refers to, sent as an entry of the frame's
+/// top-level `file_meta` array (`{ "id": ..., "name": ..., "content_type": ... }`).
 ///
-/// `scope` lists the config ids (e.g. agent ids) allowed to read the file
-/// for this message; empty = owner-only.
-public struct FileMeta: Hashable, Codable, Sendable {
+/// Build one from an upload result with `MediaRef(fileRef)`.
+public struct MediaRef: Hashable, Codable, Sendable {
+    /// Storage id of the file.
     public var id: String
-    public var scope: [String]
+    /// File name.
+    public var name: String
+    /// MIME type of the file.
+    public var contentType: String
 
-    public init(id: String, scope: [String] = []) {
+    public init(id: String, name: String, contentType: String) {
         self.id = id
-        self.scope = scope
+        self.name = name
+        self.contentType = contentType
     }
 
-    /// Attaches an uploaded file.
-    public init(_ file: FileRef, scope: [String] = []) {
-        self.init(id: file.fileId, scope: scope)
+    /// Refers to an uploaded file.
+    public init(_ file: FileRef) {
+        self.init(id: file.fileId, name: file.name, contentType: file.contentType)
     }
 
-    var jsonObject: [String: Any] { ["id": id, "scope": scope] }
+    enum CodingKeys: String, CodingKey {
+        case id, name
+        case contentType = "content_type"
+    }
+
+    var jsonObject: [String: Any] { ["id": id, "name": name, "content_type": contentType] }
 }
+
+/// Former name of `MediaRef`.
+@available(*, deprecated, renamed: "MediaRef")
+public typealias FileMeta = MediaRef

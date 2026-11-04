@@ -14,6 +14,10 @@ public struct ChannelConfig {
     /// `Subscription.thread(...)`; the dedicated `orch_com_<id>` channel
     /// used by `Orchestrator` bypasses the gate via `threadUnchecked`.
     public var orchestratorEnabled: Bool
+    /// Server-side configuration behind the channel (for example the agent
+    /// or orchestrator). Storage uses it as the owner of uploaded files.
+    /// `nil` for local channels.
+    public var configurationID: String?
 
     public init(
         channelName: String,
@@ -22,7 +26,8 @@ public struct ChannelConfig {
         presenceUsers: [String] = [],
         snapshot: Any? = nil,
         subscriptionID: String? = nil,
-        orchestratorEnabled: Bool = false
+        orchestratorEnabled: Bool = false,
+        configurationID: String? = nil
     ) {
         self.channelName = channelName
         self.channelNamespace = channelNamespace
@@ -31,5 +36,6 @@ public struct ChannelConfig {
         self.snapshot = snapshot
         self.subscriptionID = subscriptionID
         self.orchestratorEnabled = orchestratorEnabled
+        self.configurationID = configurationID
     }
 }

@@ -13,7 +13,7 @@ import Foundation
 enum ArtHTTP {
     /// Session for auth and REST calls.
     static var session: URLSession = .shared
-    /// Configuration for the per-upload sessions used by storage PUTs
+    /// Configuration for the per-upload sessions used by storage uploads
     /// (each upload needs its own delegate for progress).
     static var uploadConfiguration: URLSessionConfiguration = .ephemeral
 }
@@ -71,8 +71,8 @@ public struct HTTPCallError: Error, LocalizedError, CustomStringConvertible {
 /// 1. `Auth.authenticate()` (refreshes when needed)
 /// 2. `baseUrl ?? Constant.BASE_URL` + `endpoint` (+ form-encoded query)
 /// 3. `Authorization`, `Accept`, `X-Org`, `Environment`, `ProjectKey`,
-///    caller headers, and `Content-Type: application/json` when a payload
-///    is sent
+///    caller headers, and the body's `Content-Type`: `multipart/form-data`
+///    for a `FormDataPayload`, else `application/json`
 /// 4. Non-2xx → `HTTPCallError`; 204 / empty body → `nil`; otherwise the
 ///    decoded JSON.
 ///
@@ -80,6 +80,13 @@ public struct HTTPCallError: Error, LocalizedError, CustomStringConvertible {
 /// auth singleton.
 @discardableResult
 func httpCall(_ endpoint: String, options: CallApiProps = CallApiProps()) async throws -> Any? {
+    let request = try await artAuthorizedRequest(endpoint, options: options)
+    let (data, response) = try await ArtHTTP.session.data(for: request)
+    return try artDecodeResponse(data, response, endpoint: endpoint)
+}
+
+/// Builds the request `httpCall` sends: URL, ART headers, body and timeout.
+func artAuthorizedRequest(_ endpoint: String, options: CallApiProps) async throws -> URLRequest {
     // 1) fresh token
     let auth = try Auth.getInstance()
     let authData = try await auth.authenticate()
@@ -87,8 +94,8 @@ func httpCall(_ endpoint: String, options: CallApiProps = CallApiProps()) async 
 
     // 2) URL (+ optional query). baseUrl overrides the default host.
     var urlString = (options.baseUrl ?? Constant.BASE_URL) + endpoint
-    if let queryParams = options.queryParams {
-        urlString += "?" + ArtEncoding.formQuery(queryParams)
+    if let queryParams = options.queryParams, !queryParams.isEmpty {
+        urlString += (urlString.contains("?") ? "&" : "?") + ArtEncoding.formQuery(queryParams)
     }
     guard let url = URL(string: urlString) else {
         throw ARTError.invalidPath("Malformed API URL: \(urlString)")
@@ -105,7 +112,14 @@ func httpCall(_ endpoint: String, options: CallApiProps = CallApiProps()) async 
     options.headers?.forEach { request.setValue($1, forHTTPHeaderField: $0) }
 
     // 4) body
-    if let payload = options.payload {
+    if let form = options.payload as? FormDataPayload {
+        let body = MultipartBody()
+        request.setValue(body.contentType, forHTTPHeaderField: "Content-Type")
+        request.httpBody = body.encode(
+            fields: form.fields.keys.sorted().map { ($0, form.fields[$0] ?? "") },
+            files: form.files
+        )
+    } else if let payload = options.payload {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try ArtJSON.stringify(payload).data(using: .utf8)
     }
@@ -114,13 +128,16 @@ func httpCall(_ endpoint: String, options: CallApiProps = CallApiProps()) async 
     if let timeoutMs = options.timeoutMs {
         request.timeoutInterval = TimeInterval(timeoutMs) / 1000
     }
+    return request
+}
 
-    let (data, response) = try await ArtHTTP.session.data(for: request)
+/// Decodes a REST response: non-2xx → `HTTPCallError`; 204 / empty body →
+/// `nil`; otherwise the decoded JSON.
+func artDecodeResponse(_ data: Data, _ response: URLResponse, endpoint: String) throws -> Any? {
     guard let http = response as? HTTPURLResponse else {
         throw ARTError.serverError("No HTTP response for \(endpoint)")
     }
 
-    // 6) error handling
     guard (200..<300).contains(http.statusCode) else {
         var message = HTTPURLResponse.localizedString(forStatusCode: http.statusCode)
         var body: Any?
@@ -135,9 +152,117 @@ func httpCall(_ endpoint: String, options: CallApiProps = CallApiProps()) async 
         throw HTTPCallError(endpoint: endpoint, status: http.statusCode, message: message, body: body)
     }
 
-    // 7) 204 No Content
     if http.statusCode == 204 || data.isEmpty { return nil }
-
-    // 8) parse and resolve
     return try JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed])
+}
+
+// MARK: - Bounded requests
+
+/// `ArtHTTP.session.data(for:)`, abandoned after `timeoutMs` milliseconds:
+/// the request is cancelled and the error from `timeoutError` is thrown.
+func artData(
+    for request: URLRequest,
+    timeoutMs: Int,
+    timeoutError: @escaping @Sendable () -> Error
+) async throws -> (Data, URLResponse) {
+    var request = request
+    request.timeoutInterval = max(TimeInterval(timeoutMs) / 1000, 0.001)
+    let session = ArtHTTP.session
+    return try await withThrowingTaskGroup(of: (Data, URLResponse).self) { group in
+        group.addTask {
+            do {
+                return try await session.data(for: request)
+            } catch let error as URLError where error.code == .timedOut {
+                throw timeoutError()
+            }
+        }
+        group.addTask {
+            try await Task.sleep(nanoseconds: UInt64(max(timeoutMs, 0)) * 1_000_000)
+            throw timeoutError()
+        }
+        defer { group.cancelAll() }
+        guard let result = try await group.next() else { throw CancellationError() }
+        return result
+    }
+}
+
+// MARK: - Multipart bodies
+
+/// Builds `multipart/form-data` bodies: text fields first, then files.
+struct MultipartBody {
+    let boundary = "ArtAdkFormBoundary\(UUID().uuidString.replacingOccurrences(of: "-", with: ""))"
+
+    var contentType: String { "multipart/form-data; boundary=\(boundary)" }
+
+    /// The whole body in memory.
+    func encode(fields: [(String, String)], files: [FormDataFile]) -> Data {
+        var body = encodeFields(fields)
+        for file in files {
+            body.append(fileHeader(field: file.field, filename: file.filename, contentType: file.contentType))
+            body.append(file.data)
+            body.append(Data("\r\n".utf8))
+        }
+        body.append(closing)
+        return body
+    }
+
+    /// Writes a body with one file part, copied from `source` in chunks,
+    /// to `destination`, so large files are never held in memory.
+    func write(
+        fields: [(String, String)],
+        field: String,
+        filename: String,
+        contentType: String,
+        source: URL,
+        to destination: URL
+    ) throws {
+        guard FileManager.default.createFile(atPath: destination.path, contents: nil) else {
+            throw CocoaError(.fileWriteUnknown)
+        }
+        let output = try FileHandle(forWritingTo: destination)
+        defer { try? output.close() }
+        let input = try FileHandle(forReadingFrom: source)
+        defer { try? input.close() }
+
+        var head = encodeFields(fields)
+        head.append(fileHeader(field: field, filename: filename, contentType: contentType))
+        try output.write(contentsOf: head)
+        while let chunk = try input.read(upToCount: 1 << 20), !chunk.isEmpty {
+            try output.write(contentsOf: chunk)
+        }
+        var tail = Data("\r\n".utf8)
+        tail.append(closing)
+        try output.write(contentsOf: tail)
+    }
+
+    private var closing: Data { Data("--\(boundary)--\r\n".utf8) }
+
+    private func encodeFields(_ fields: [(String, String)]) -> Data {
+        var body = Data()
+        for (name, value) in fields {
+            body.append(Data((
+                "--\(boundary)\r\n" +
+                "Content-Disposition: form-data; name=\"\(MultipartBody.quoted(name))\"\r\n\r\n" +
+                "\(value)\r\n"
+            ).utf8))
+        }
+        return body
+    }
+
+    private func fileHeader(field: String, filename: String, contentType: String?) -> Data {
+        Data((
+            "--\(boundary)\r\n" +
+            "Content-Disposition: form-data; name=\"\(MultipartBody.quoted(field))\"; " +
+            "filename=\"\(MultipartBody.quoted(filename))\"\r\n" +
+            "Content-Type: \(contentType ?? "application/octet-stream")\r\n\r\n"
+        ).utf8)
+    }
+
+    /// Escapes a quoted header parameter the way browsers do.
+    private static func quoted(_ value: String) -> String {
+        value
+            .replacingOccurrences(of: "\"", with: "%22")
+            .replacingOccurrences(of: "\r", with: "%0D")
+            .replacingOccurrences(of: "\n", with: "%0A")
+    }
 }

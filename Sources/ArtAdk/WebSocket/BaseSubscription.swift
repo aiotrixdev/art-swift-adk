@@ -80,8 +80,8 @@ open class BaseSubscription {
     var bufferStorage = EventBuffer()
 
     private var pendingAcks: [String: PendingAck] = [:]
-    /// How long `push` waits for the server `SA` ACK on targeted channels,
-    /// in milliseconds.
+    /// How long `push` waits for the server `SA` ACK on targeted and secure
+    /// channels, in milliseconds.
     var ackTimeoutMs: Double = 50_000
     private var messageCount: Int = 0
 
@@ -156,6 +156,19 @@ open class BaseSubscription {
     /// Lock-free, so the socket may call it while holding its own lock.
     func enqueue(event: String, payload: [String: Any]) {
         inboundContinuation.yield(InboundMessage(event: event, payload: payload))
+    }
+
+    // MARK: - Connection failures
+    /// Calls `listener` when the connection fails. Returns an id for
+    /// `offConnectionFailure(_:)`.
+    @discardableResult
+    public func onConnectionFailure(_ listener: @escaping (ConnectionError) -> Void) -> UUID {
+        websocketHandler.onConnectionFailure(listener)
+    }
+
+    /// Removes a listener added with `onConnectionFailure(_:)`.
+    public func offConnectionFailure(_ id: UUID) {
+        websocketHandler.offConnectionFailure(id)
     }
 
     // MARK: - Validate subscription
@@ -287,7 +300,7 @@ open class BaseSubscription {
         }
 
         if let str = try? ArtJSON.stringify(response) {
-            _ = websocketHandler.sendMessage(str)
+            _ = try? websocketHandler.sendMessage(str)
         }
     }
 
@@ -310,11 +323,15 @@ open class BaseSubscription {
 
     private func failPendingAck(_ refId: String, _ error: Error) {
         let entry = stateLock.sync { pendingAcks.removeValue(forKey: refId) }
+        entry?.timer.cancel()
         entry?.continuation.resume(throwing: error)
     }
 
     // MARK: - Subscribe
-    public func subscribe() async {
+    /// (Re)subscribes to the channel. Throws when the server refuses, and
+    /// the `ConnectionError` when the connection fails; call it again after
+    /// reconnecting.
+    public func subscribe() async throws {
 
         guard !BaseSubscription.reservedChannels.contains(channelConfig.channelName) else {
             return
@@ -335,6 +352,7 @@ open class BaseSubscription {
         } catch {
             ArtLog.error("subscribe failed for \(channelConfig.channelName): \(error)")
             isSubscribed = false
+            throw error
         }
     }
 
@@ -377,7 +395,11 @@ open class BaseSubscription {
                 await validateSubscription(process: "presence")
             }
 
-            await subscribe()
+            do {
+                try await subscribe()
+            } catch {
+                ArtLog.error("Channel reconnection failed for \(name): \(error)")
+            }
         }
     }
 
@@ -386,8 +408,16 @@ open class BaseSubscription {
     /// Sends an event on this channel. Returns the SDK-generated `ref_id`
     /// (or `nil` for control channels, which are not ref-tracked).
     ///
-    /// On **targeted** channels the call waits for the server's `SA`
-    /// acknowledgement and throws `ARTError.ackTimeout` after 50 s.
+    /// The connection's authorisation is renewed first when the access
+    /// token changed. On **targeted** and **secure** channels the call waits
+    /// for the server's `SA` acknowledgement, except for `art_presence`
+    /// requests, whose answer is the presence update itself.
+    ///
+    /// Throws a `ConnectionError` when the connection has failed or fails
+    /// before the acknowledgement, when there is no connection to send on,
+    /// or when the acknowledgement does not arrive within 50 s
+    /// (`ACK_TIMEOUT`). The message is never resent, so check whether it
+    /// took effect before pushing it again.
     @discardableResult
     public func push(
         event: String,
@@ -405,7 +435,8 @@ open class BaseSubscription {
     /// Builds and sends a push frame for any JSON-compatible content.
     func sendFrame(event: String, content: Any, options: PushConfig?) async throws -> String? {
 
-        await websocketHandler.wait()
+        try await websocketHandler.wait()
+        try await websocketHandler.ensureAuthorization()
 
         guard let connection = websocketHandler.getConnection() else {
             throw ARTError.notConnected
@@ -455,9 +486,8 @@ open class BaseSubscription {
                 return messageCount
             }
             refId = "\(connection.connectionId)_\(config.channelName)_\(count)"
-            // Note: this compares the channel *name* with "secure", so in
-            // practice only targeted channels wait for the SA acknowledgement.
-            awaitsAck = config.channelType == "targeted" || config.channelName == "secure"
+            awaitsAck = (config.channelType == "targeted" || config.channelType == "secure")
+                && event != "art_presence"
         }
 
         var message: [String: Any] = [
@@ -478,13 +508,22 @@ open class BaseSubscription {
         if let fileMeta = options?.fileMeta, !fileMeta.isEmpty {
             message["file_meta"] = fileMeta.map { $0.jsonObject }
         }
+        if let executionOrigin = options?.executionOrigin {
+            message["execution_origin"] = executionOrigin.rawValue
+        }
 
         let frame = try ArtJSON.stringify(message)
 
         guard awaitsAck, let refId else {
-            _ = websocketHandler.sendMessage(frame)
+            try websocketHandler.sendMessage(frame)
             return refId
         }
+
+        // A failed connection ends the wait for the acknowledgement.
+        let failureListener = onConnectionFailure { [weak self] error in
+            self?.failPendingAck(refId, error)
+        }
+        defer { offConnectionFailure(failureListener) }
 
         // Register the ACK before sending so a fast `SA` can't be missed.
         let timeoutNs = UInt64(ackTimeoutMs * 1_000_000)
@@ -492,12 +531,19 @@ open class BaseSubscription {
             let timer = Task {
                 try? await Task.sleep(nanoseconds: timeoutNs)
                 guard !Task.isCancelled else { return }
-                self.failPendingAck(refId, ARTError.ackTimeout)
+                self.failPendingAck(refId, ConnectionError(
+                    "The server has not acknowledged this request. Check its status before retrying.",
+                    code: "ACK_TIMEOUT"
+                ))
             }
             stateLock.sync {
                 pendingAcks[refId] = PendingAck(continuation: continuation, timer: timer)
             }
-            _ = websocketHandler.sendMessage(frame)
+            do {
+                try websocketHandler.sendMessage(frame)
+            } catch {
+                failPendingAck(refId, error)
+            }
         }
     }
 

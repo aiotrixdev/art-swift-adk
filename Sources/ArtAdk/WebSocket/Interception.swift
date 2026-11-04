@@ -29,7 +29,13 @@ public final class Interception {
     }
 
     public func reconnect() {
-        Task { try? await validateInterception() }
+        Task {
+            do {
+                try await validateInterception()
+            } catch {
+                ArtLog.error("Interceptor reconnection failed for \(interceptorName): \(error)")
+            }
+        }
     }
     
     private func createResponse(
@@ -157,9 +163,9 @@ public final class Interception {
 
     private func sendJSON(_ dict: [String: Any]) {
         do {
-            _ = websocketHandler.sendMessage(try ArtJSON.stringify(dict))
+            try websocketHandler.sendMessage(try ArtJSON.stringify(dict))
         } catch {
-            ArtLog.error("Interceptor response is not JSON-serializable: \(error)")
+            ArtLog.error("Interceptor response could not be sent: \(error)")
         }
     }
 }
