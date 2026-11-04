@@ -87,12 +87,28 @@ public final class Subscription: BaseSubscription {
         try await super.push(event: event, data: data, options: options)
     }
 
+    // MARK: - Configuration
+    /// Id of the server-side configuration behind this channel (for example
+    /// the agent or orchestrator), resolved when subscribing. Storage uses it
+    /// as the owner of uploaded files.
+    ///
+    /// Throws `ARTError.serverError` when the server did not resolve one.
+    public var configurationId: String {
+        get throws {
+            guard let id = channelConfig.configurationID, !id.isEmpty else {
+                throw ARTError.serverError("Configuration was not resolved by the server")
+            }
+            return id
+        }
+    }
+
     // MARK: - Storage (channel-scoped)
     //
-    // Only on orchestrator-enabled channels, scoped to the channel name.
+    // Only on orchestrator-enabled channels; files are owned by the
+    // channel's `configurationId`, and `threadId` is required.
 
-    /// Uploads a local file scoped to this channel (`config_id` = channel
-    /// name). Throws unless the channel is orchestrator-enabled.
+    /// Uploads a local file owned by this channel's `configurationId`.
+    /// Throws unless the channel is orchestrator-enabled.
     @discardableResult
     public func upload(fileURL: URL, options: UploadOptions = UploadOptions()) async throws -> FileRef {
         try await Storage().upload(fileURL: fileURL, options: try channelScoped(options))
@@ -112,28 +128,27 @@ public final class Subscription: BaseSubscription {
         )
     }
 
-    /// Lists files scoped to this channel. Throws unless the channel is
+    /// Lists the files this channel's `configurationId` can access in
+    /// `options.threadId`. Throws unless the channel is
     /// orchestrator-enabled.
     public func listFiles(options: ListOptions = ListOptions()) async throws -> StorageFileList {
-        let config = try requireOrchestratorChannel()
+        try requireOrchestratorChannel()
         var scoped = options
-        scoped.configId = config.channelName
+        scoped.configId = try configurationId
         return try await Storage().listFiles(options: scoped)
     }
 
     private func channelScoped(_ options: UploadOptions) throws -> UploadOptions {
-        let config = try requireOrchestratorChannel()
+        try requireOrchestratorChannel()
         var scoped = options
-        scoped.configId = config.channelName
+        scoped.configId = try configurationId
         return scoped
     }
 
-    private func requireOrchestratorChannel() throws -> ChannelConfig {
-        let config = channelConfig
-        guard config.orchestratorEnabled else {
+    private func requireOrchestratorChannel() throws {
+        guard channelConfig.orchestratorEnabled else {
             throw UploadError("Storage requires an orchestrator-enabled channel", step: .validate)
         }
-        return config
     }
 
     // MARK: - Thread-scoped routing
@@ -461,8 +476,10 @@ public final class Subscription: BaseSubscription {
             return
         }
 
-        if let msgStr = try? ArtJSON.stringify(reply) {
-            _ = websocketHandler.sendMessage(msgStr)
+        do {
+            try websocketHandler.sendMessage(try ArtJSON.stringify(reply))
+        } catch {
+            ArtLog.error("HITL reply could not be sent: \(error)")
         }
     }
 }

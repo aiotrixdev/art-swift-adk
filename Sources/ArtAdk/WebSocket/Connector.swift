@@ -72,7 +72,7 @@ public final class Connector {
         action: String,
         metadata: [String: String]?
     ) async throws -> [String: Any] {
-        await handler.wait()
+        try await handler.wait()
         var payload: [String: Any] = [
             "action": action,
             "connector_id": connectorId,
