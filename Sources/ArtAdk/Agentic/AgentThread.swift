@@ -18,7 +18,8 @@ public typealias AgentHumanInputHandler = (HumanInputRequest, Run) -> Void
 ///
 /// Outbound messages carry a top-level `thread_id`, and replies tagged
 /// with this thread's id are routed back to it (as well as untagged
-/// channel events).
+/// channel events). When the connection fails, the active run ends with an
+/// `agent_error` whose details have `source: connection`.
 public final class AgentThread {
 
     /// The owning agent.
@@ -30,11 +31,19 @@ public final class AgentThread {
     public let threadId: String
 
     private let lock = ArtLock()
-    private var masterListenerTask: Task<Bool, Never>?
+    private var masterListenerTask: Task<Void, Error>?
     private var userListeners: [AgentUserListener] = []
     private var feedbackHandlers: [AgentHumanInputHandler] = []
     private var activeRun: Run?
     private let stateStore: ThreadStateStore
+    private var disposed = false
+    /// Origin of the latest run; replies keep it.
+    private var executionOrigin: ExecutionOrigin?
+    private var subscription: Subscription?
+    private var channelListenerId: UUID?
+    private var threadListenerId: UUID?
+    private var connectionListenerId: UUID?
+    private var traceListenerIds: [(channel: UUID, thread: UUID)] = []
 
     /// Created via `Agent.thread()`; not for direct instantiation.
     init(agent: Agent, threadId: String? = nil) {
@@ -48,12 +57,81 @@ public final class AgentThread {
         UUID().uuidString.lowercased()
     }
 
+    // MARK: - Lifecycle
+
+    /// Whether `dispose()` has been called.
+    public var isDisposed: Bool { lock.sync { disposed } }
+
+    /// Stops this thread: ends its active run and removes only this
+    /// thread's listeners. The agent's channel stays connected for other
+    /// threads.
+    ///
+    /// Calling it again does nothing. Afterwards `run`, replies, `listen`,
+    /// `listenState` and `listenTrace` throw.
+    public func dispose() {
+        typealias Detached = (
+            run: Run?, subscription: Subscription?, channel: UUID?, thread: UUID?,
+            connection: UUID?, traces: [(channel: UUID, thread: UUID)]
+        )
+        let detached: Detached? = lock.sync {
+            guard !disposed else { return nil }
+            disposed = true
+            let detached: Detached = (
+                activeRun, subscription, channelListenerId, threadListenerId,
+                connectionListenerId, traceListenerIds
+            )
+            activeRun = nil
+            userListeners.removeAll()
+            feedbackHandlers.removeAll()
+            channelListenerId = nil
+            threadListenerId = nil
+            connectionListenerId = nil
+            traceListenerIds.removeAll()
+            return detached
+        }
+        guard let detached else { return }
+        detached.run?.abort("Thread disposed")
+        stateStore.removeAllListeners()
+        if let id = detached.connection { agent.offConnectionFailure(id) }
+        guard let sub = detached.subscription else { return }
+        if let id = detached.channel { sub.remove(event: "all", id: id) }
+        if let id = detached.thread { sub.detachThreadListener(threadId, "all", id: id) }
+        for trace in detached.traces {
+            sub.remove(event: "trace", id: trace.channel)
+            sub.detachThreadListener(threadId, "trace", id: trace.thread)
+        }
+    }
+
+    private var disposedError: ARTError {
+        ARTError.serverError("AgentThread \(threadId) has been disposed")
+    }
+
+    private func ensureActive() throws {
+        if isDisposed { throw disposedError }
+    }
+
+    private func guardActive(_ operation: String) -> Bool {
+        if isDisposed {
+            ArtLog.warn("AgentThread \(threadId) has been disposed; ignoring \(operation)")
+            return false
+        }
+        return true
+    }
+
+    // MARK: - Listeners
+
     /// Subscribes `callback` to every typed event delivered to this thread.
     ///
     /// Multiple callbacks may be registered; each receives every event.
     /// The first call also installs the underlying subscription listeners.
-    public func listen(_ callback: @escaping AgentUserListener) async {
-        await ensureMasterListener()
+    ///
+    /// Throws when subscribing to the agent's channel fails, for example
+    /// `ARTError.serverError` when the server refuses access to the agent,
+    /// or a `ConnectionError`. `callback` isn't kept then, so call `listen`
+    /// again to retry. Also throws once the thread is disposed.
+    public func listen(_ callback: @escaping AgentUserListener) async throws {
+        try await ensureMasterListener()
+        try ensureActive()
         lock.sync { userListeners.append(callback) }
     }
 
@@ -62,12 +140,15 @@ public final class AgentThread {
     /// failed, and server `thread_state` updates). When `emitCurrent` is
     /// `true` the current state is delivered immediately. Returns a closure
     /// that removes the callback.
+    ///
+    /// Throws like `listen(_:)`.
     @discardableResult
     public func listenState(
         _ callback: @escaping (ThreadState) -> Void,
         emitCurrent: Bool = true
-    ) async -> () -> Void {
-        await ensureMasterListener()
+    ) async throws -> () -> Void {
+        try await ensureMasterListener()
+        try ensureActive()
         let id = stateStore.addListener(callback)
         if emitCurrent { callback(stateStore.state) }
         return { [weak self] in self?.stateStore.removeListener(id) }
@@ -81,16 +162,31 @@ public final class AgentThread {
     /// Subscribes `callback` to inbound `trace` diagnostic / telemetry frames
     /// (heartbeats, checkpoints, deadlock signals) on this thread. Each frame
     /// is delivered as its raw value.
+    ///
+    /// Throws like `listen(_:)`.
     @available(*, deprecated, message: "Use listenState(_:emitCurrent:) for operational UI. Trace is reserved for diagnostics.")
-    public func listenTrace(_ callback: @escaping (Any) -> Void) async {
-        guard let sub = try? await agent.getSubscription() else { return }
-        sub.bind(event: "trace", callback: callback)
-        sub.attachThreadBind(threadId, "trace", callback)
+    public func listenTrace(_ callback: @escaping (Any) -> Void) async throws {
+        try ensureActive()
+        let sub = try await agent.getSubscription()
+        let channel = sub.bind(event: "trace", callback: callback)
+        let thread = sub.attachThreadBind(threadId, "trace", callback)
+        let kept: Bool = lock.sync {
+            guard !disposed else { return false }
+            subscription = sub
+            traceListenerIds.append((channel: channel, thread: thread))
+            return true
+        }
+        if !kept {
+            sub.remove(event: "trace", id: channel)
+            sub.detachThreadListener(threadId, "trace", id: thread)
+            try ensureActive()
+        }
     }
 
     /// Registers a handler invoked whenever a `HumanInputRequest` arrives
     /// for the currently active `Run`.
     public func feedbackRequest(_ handler: @escaping AgentHumanInputHandler) {
+        guard guardActive("feedbackRequest") else { return }
         lock.sync { feedbackHandlers.append(handler) }
     }
 
@@ -102,15 +198,34 @@ public final class AgentThread {
     /// than `user_input`. If a previous run is still active it is
     /// force-closed — each thread may only have one active run at a time.
     ///
+    /// Throws once the thread is disposed, and when subscribing to the
+    /// agent's channel fails (see `listen(_:)`); nothing is sent then.
+    /// Throws a `ConnectionError` when the connection fails before the
+    /// request is sent (or, on channels that acknowledge messages, before
+    /// the server acknowledges it); the run then ends with an `agent_error`
+    /// too. The request is never resent, so check whether it took effect
+    /// before running it again.
+    ///
     /// - Parameters:
     ///   - userInput: the message for the agent, usually a `String`.
     ///   - replyId: the `ref_id` of the agent message this input answers.
     ///   - fileMeta: uploaded files the agent may use, sent as the
     ///     frame's `file_meta`. Upload first,
-    ///     e.g. `FileMeta(try await agent.upload(fileURL: url))`.
+    ///     e.g. `MediaRef(try await thread.upload(fileURL: url))`.
+    ///   - executionOrigin: where the run was started, sent as
+    ///     `execution_origin` on the run and on the replies sent while it is
+    ///     the latest run. Leave it `nil` for ordinary runs.
     @discardableResult
-    public func run(_ userInput: Any, replyId: String? = nil, fileMeta: [FileMeta] = []) async throws -> Run {
-        await ensureMasterListener()
+    public func run(
+        _ userInput: Any,
+        replyId: String? = nil,
+        fileMeta: [MediaRef] = [],
+        executionOrigin: ExecutionOrigin? = nil
+    ) async throws -> Run {
+        lock.sync { self.executionOrigin = executionOrigin }
+        try await ensureMasterListener()
+        let sub = try await agent.getSubscription()
+        try ensureActive()
 
         let run = Run(self)
         let previous: Run? = lock.sync {
@@ -125,7 +240,6 @@ public final class AgentThread {
 
         stateStore.transition(.submitted, .client, "Request submitted")
 
-        let sub = try await agent.getSubscription()
         let event = (replyId != nil) ? "user_reply" : "user_input"
         var content: [String: Any] = [
             "user_input": userInput,
@@ -135,24 +249,32 @@ public final class AgentThread {
             content["reply_id"] = replyId
         }
 
-        let refId = try await sub.push(
-            event: event,
-            data: content,
-            options: PushConfig(threadID: threadId, fileMeta: fileMeta)
-        )
-        run.setRefId(refId ?? "")
-        return run
+        do {
+            let refId = try await sub.push(
+                event: event,
+                data: content,
+                options: PushConfig(threadID: threadId, fileMeta: fileMeta, executionOrigin: executionOrigin)
+            )
+            run.setRefId(refId ?? "")
+            return run
+        } catch {
+            if let connectionError = error as? ConnectionError {
+                handleConnectionFailure(connectionError)
+            }
+            run.abort(artErrorMessage(error) ?? "The request could not be sent.")
+            closeRun(run)
+            throw error
+        }
     }
 
     // MARK: - Storage (thread-scoped)
 
-    /// Uploads a local file, scoped to this thread: `configId` is always
-    /// set to `threadId`, whatever `options` contains.
+    /// Uploads a local file for this thread, owned by the agent's channel
+    /// configuration (`options.configId` and `options.threadId` are always
+    /// set).
     @discardableResult
     public func upload(fileURL: URL, options: UploadOptions = UploadOptions()) async throws -> FileRef {
-        var opts = options
-        opts.configId = threadId
-        return try await Storage().upload(fileURL: fileURL, options: opts)
+        try await Storage().upload(fileURL: fileURL, options: try await scoped(options))
     }
 
     /// Byte-based variant of `upload(fileURL:options:)`, for callers that
@@ -164,16 +286,26 @@ public final class AgentThread {
         contentType: String? = nil,
         options: UploadOptions = UploadOptions()
     ) async throws -> FileRef {
-        var opts = options
-        opts.configId = threadId
-        return try await Storage().upload(data: data, filename: filename, contentType: contentType, options: opts)
+        try await Storage().upload(
+            data: data, filename: filename, contentType: contentType,
+            options: try await scoped(options)
+        )
     }
 
-    /// Lists files scoped to this thread's `threadId`.
+    /// Lists this thread's files that the agent's channel configuration can
+    /// access.
     public func listFiles(options: ListOptions = ListOptions()) async throws -> StorageFileList {
         var opts = options
-        opts.configId = threadId
+        opts.configId = try await agent.getSubscription().configurationId
+        opts.threadId = threadId
         return try await Storage().listFiles(options: opts)
+    }
+
+    private func scoped(_ options: UploadOptions) async throws -> UploadOptions {
+        var opts = options
+        opts.configId = try await agent.getSubscription().configurationId
+        opts.threadId = threadId
+        return opts
     }
 
     // MARK: - Internal (called by Run)
@@ -197,7 +329,9 @@ public final class AgentThread {
     /// prompt.
     @discardableResult
     func sendReply(_ value: Any, _ replyId: String) async throws -> String {
+        try ensureActive()
         let sub = try await agent.getSubscription()
+        try ensureActive()
         let content: [String: Any] = [
             "user_input": value,
             "thread_id": threadId,
@@ -206,7 +340,7 @@ public final class AgentThread {
         let refId = try await sub.push(
             event: "user_reply",
             data: content,
-            options: PushConfig(threadID: threadId)
+            options: PushConfig(threadID: threadId, executionOrigin: lock.sync { executionOrigin })
         )
         return refId ?? ""
     }
@@ -214,35 +348,92 @@ public final class AgentThread {
     // MARK: - Dispatch
 
     /// Installs, once, the subscription listeners that fan out to user
-    /// callbacks and the active run: the channel-wide `listen` plus the
-    /// thread-scoped route for frames tagged with this `thread_id`. A
-    /// failed subscribe is retried on the next call.
-    private func ensureMasterListener() async {
-        let task: Task<Bool, Never> = lock.sync {
+    /// callbacks and the active run: the channel-wide `listen`, the
+    /// thread-scoped route for frames tagged with this `thread_id`, and the
+    /// connection-failure listener. A failed subscribe is not kept, so the
+    /// next call tries again.
+    private func ensureMasterListener() async throws {
+        let task: Task<Void, Error> = try lock.sync {
+            if disposed { throw disposedError }
             if let existing = masterListenerTask { return existing }
-            let started = Task { [weak self] () -> Bool in
-                guard let self else { return false }
+            let started = Task { [weak self] () throws -> Void in
+                guard let self else { return }
                 do {
                     let sub = try await self.agent.getSubscription()
-                    sub.listen { [weak self] raw in self?.dispatch(raw) }
-                    sub.attachThreadListener(self.threadId) { [weak self] raw in self?.dispatch(raw) }
-                    return true
+                    try self.attachListeners(to: sub)
                 } catch {
                     ArtLog.error("[adk] agent subscription failed: \(error)")
-                    return false
+                    throw error
                 }
             }
             masterListenerTask = started
             return started
         }
-        if await task.value == false {
+        do {
+            try await task.value
+        } catch {
             lock.sync {
                 if masterListenerTask == task { masterListenerTask = nil }
             }
+            throw error
         }
     }
 
+    /// Throws, leaving nothing attached, when the thread was disposed
+    /// meanwhile.
+    private func attachListeners(to sub: Subscription) throws {
+        try ensureActive()
+        let channel = sub.listen { [weak self] raw in self?.dispatch(raw) }
+        let thread = sub.attachThreadListener(threadId) { [weak self] raw in self?.dispatch(raw) }
+        let connection = agent.onConnectionFailure { [weak self] error in
+            self?.handleConnectionFailure(error)
+        }
+        let kept: Bool = lock.sync {
+            guard !disposed else { return false }
+            subscription = sub
+            channelListenerId = channel
+            threadListenerId = thread
+            connectionListenerId = connection
+            return true
+        }
+        if !kept {
+            sub.remove(event: "all", id: channel)
+            sub.detachThreadListener(threadId, "all", id: thread)
+            agent.offConnectionFailure(connection)
+            throw disposedError
+        }
+    }
+
+    /// Ends the active run with an `agent_error` when the connection fails,
+    /// since no channel event can arrive after that. Its details carry
+    /// `source: connection` and `execution_status: unknown`: the client can
+    /// no longer tell whether the server finished the execution.
+    private func handleConnectionFailure(_ error: ConnectionError) {
+        guard lock.sync({ activeRun != nil }) else { return }
+        var details: [String: Any] = [
+            "reason": error.message,
+            "source": "connection",
+            "execution_status": "unknown",
+        ]
+        if let status = error.status { details["status"] = status }
+        dispatch([
+            "event": "agent_error",
+            "content": [
+                "type": "agent_error_response",
+                "status": "error",
+                "code": error.code,
+                "message": error.message,
+                "details": details,
+                "thread_id": threadId,
+                "ref_id": "",
+                "agent_id": agent.agentId,
+                "reply_to": "",
+            ] as [String: Any],
+        ])
+    }
+
     private func dispatch(_ raw: [String: Any]) {
+        guard !isDisposed else { return }
         var envelope = parseAgentEvent(raw)
 
         // Surface wire-level transport errors as a typed
@@ -324,7 +515,11 @@ public final class AgentThread {
         case .output:
             stateStore.transition(.completed, .agent, "Completed")
         case .error(let error):
-            stateStore.transition(.failed, .agent, "Execution failed", reason: error.message)
+            if error.details?["source"] as? String == "connection" {
+                stateStore.transition(.failed, .client, "Connection unavailable", reason: error.message)
+            } else {
+                stateStore.transition(.failed, .agent, "Execution failed", reason: error.message)
+            }
         case .plannerCorrection, .unknown:
             break
         }

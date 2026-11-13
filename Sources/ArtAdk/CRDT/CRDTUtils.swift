@@ -207,7 +207,12 @@ public enum ARTError: Error, LocalizedError {
     case timeout(String)
     case serverError(String)
     case channelNotFound(String)
+    /// No longer thrown: a missing acknowledgement now throws a
+    /// `ConnectionError` with code `ACK_TIMEOUT`.
     case ackTimeout
+    /// A value passed to the SDK is not valid, for example an agent id that
+    /// is not a lowercase slug.
+    case invalidArgument(String)
 
     public var errorDescription: String? {
         switch self {
@@ -221,6 +226,21 @@ public enum ARTError: Error, LocalizedError {
         case .serverError(let m):        return "Server error: \(m)"
         case .channelNotFound(let m):    return "Channel not found: \(m)"
         case .ackTimeout:                return "ACK timeout"
+        case .invalidArgument(let m):    return "Invalid argument: \(m)"
+        }
+    }
+
+    /// The message without the error-kind prefix of `errorDescription`.
+    public var message: String {
+        switch self {
+        case .forbidden(let m), .authenticationFailed(let m), .invalidPath(let m),
+             .encryptionError(let m), .decryptionError(let m), .timeout(let m),
+             .serverError(let m), .channelNotFound(let m), .invalidArgument(let m):
+            return m
+        case .notConnected:
+            return "Not connected"
+        case .ackTimeout:
+            return "ACK timeout"
         }
     }
 }

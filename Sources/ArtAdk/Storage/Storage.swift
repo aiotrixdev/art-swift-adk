@@ -2,18 +2,19 @@
 //  Storage.swift
 //  ArtAdk
 //
-//  upload(file)
-//    1. POST {gateway}/api/{org}/storage/upload/signed-url   (authenticated)
-//       { config_type, config_id, file_name, file_size, content_type,
-//         scopes, ttl_seconds? } → { file_id, upload_url }
-//    2. PUT upload_url  (x-ms-blob-type: BlockBlob; no ART auth — SAS URL)
-//    3. POST {gateway}/api/{org}/storage/upload/confirm/{file_id}
-//       → { read_url, file }
+//  Temporary media, scoped to a conversation thread and owned by a
+//  configuration (an agent, an orchestrator, or the project by default):
+//    upload  POST   {gateway}/api/{org}/datalake/v1/system-buckets/temp/objects
+//            multipart: file, owner_config_id, thread_id, ttl_seconds?,
+//            allowed_mime_types? → then POST /objects/{id}/access-url
+//    list    GET    /objects?accessible_by=&thread_id=&page=&page_size=
+//    get     GET    /objects/{id} + POST /objects/{id}/access-url
+//    delete  DELETE /objects/{id}
 //  `{gateway}` is Constant.BASE_URL without a trailing `/ws`.
 //
 //  To let an agent use an uploaded file, attach it to the run:
-//    let ref = try await agent.upload(fileURL: url)
-//    try await thread.run("Summarize this", fileMeta: [FileMeta(ref)])
+//    let ref = try await thread.upload(fileURL: url)
+//    try await thread.run("Summarize this", fileMeta: [MediaRef(ref)])
 //
 
 import Foundation
@@ -35,6 +36,11 @@ public final class Storage {
     /// Uploads a local file (e.g. a `PhotosPicker` / `fileImporter` result),
     /// streaming it from disk. The file name and MIME type are taken from
     /// the URL (`options.filename` overrides the name).
+    ///
+    /// `options.threadId` is required. Throws `UploadError` with step
+    /// `validate` when the file is empty, the thread id is missing or the
+    /// ADK is not connected, and with step `upload` or `get` when the server
+    /// rejects the request.
     @discardableResult
     public func upload(fileURL: URL, options: UploadOptions = UploadOptions()) async throws -> FileRef {
         let didStartScopedAccess = fileURL.startAccessingSecurityScopedResource()
@@ -80,8 +86,7 @@ public final class Storage {
     ///   - filename: used when `options.filename` is not set, else
     ///     `upload.bin`.
     ///   - contentType: MIME type; defaults to `application/octet-stream`.
-    ///   - options: upload settings such as the owner, scopes and progress
-    ///     callback.
+    ///   - options: upload settings; `threadId` is required.
     @discardableResult
     public func upload(
         data: Data,
@@ -108,201 +113,253 @@ public final class Storage {
         guard byteCount > 0 else {
             throw UploadError("file is empty", step: .validate)
         }
-
-        let auth: Auth
-        do {
-            auth = try Auth.getInstance()
-        } catch {
-            throw UploadError("call connect() before upload()", step: .validate)
-        }
-
+        let credentials = try Storage.credentials("call connect() before upload()")
         let fileName = options.filename ?? filename ?? "upload.bin"
-        let configId = options.configId ?? auth.getCredentials().projectKey
+        let configId = options.configId ?? credentials.projectKey
+        let threadId = try Storage.requireThreadId(options.threadId)
 
-        var requestBody: [String: Any] = [
-            "config_type": (options.configType ?? .media).rawValue,
-            "config_id": configId,
-            "file_name": fileName,
-            "file_size": byteCount,
-            "content_type": contentType,
-            "scopes": options.scopes,
+        var fields: [(String, String)] = [
+            ("owner_config_id", configId),
+            ("thread_id", threadId),
         ]
-        if let ttl = options.ttlSeconds { requestBody["ttl_seconds"] = ttl }
-
-        let initResponse = try await storageCall(
-            .signedURL, method: "POST", path: "/upload/signed-url",
-            body: requestBody, timeoutMs: options.timeoutMs
-        )
-
-        guard
-            let fileId = ArtJSON.string(initResponse["file_id"]),
-            let uploadURLString = initResponse["upload_url"] as? String,
-            let uploadURL = URL(string: uploadURLString)
-        else {
-            throw UploadError("signed-url missing file_id/upload_url", step: .signedURL)
+        if let ttl = options.ttlSeconds { fields.append(("ttl_seconds", String(ttl))) }
+        if let mimeTypes = options.allowedMimeTypes, !mimeTypes.isEmpty {
+            let json = (try? JSONSerialization.data(withJSONObject: mimeTypes, options: [.withoutEscapingSlashes]))
+                .flatMap { String(data: $0, encoding: .utf8) } ?? "[]"
+            fields.append(("allowed_mime_types", json))
         }
 
-        try await putToStorage(uploadURL, body: body, contentType: contentType, options: options)
+        options.progress?(0)
+        let object = try await sendUpload(
+            body, fields: fields, filename: fileName, contentType: contentType,
+            baseUrl: Storage.baseUrl(credentials), options: options
+        )
+        guard let objectId = ArtJSON.string(object["id"]) else {
+            throw UploadError("Datalake upload did not return an object ID", step: .upload)
+        }
+        options.progress?(1)
 
-        let done = try await storageCall(
-            .confirm, method: "POST", path: "/upload/confirm/\(ArtEncoding.uriComponent(fileId))",
+        let access = try await datalakeCall(
+            .get, method: "POST",
+            path: "/objects/\(ArtEncoding.uriComponent(objectId))/access-url",
+            query: Storage.accessQuery(configId, threadId),
             timeoutMs: options.timeoutMs
         )
-
-        let file = done["file"] as? [String: Any]
+        let storedName = object["name"] as? String ?? ""
+        let storedType = object["content_type"] as? String ?? ""
         return FileRef(
-            fileId: fileId,
-            name: fileName,
-            readUrl: done["read_url"] as? String ?? "",
-            size: ArtJSON.int(file?["file_size"]) ?? byteCount,
-            contentType: contentType
+            fileId: objectId,
+            name: storedName.isEmpty ? fileName : storedName,
+            readUrl: (access as? [String: Any])?["read_url"] as? String ?? "",
+            size: ArtJSON.int(object["size_bytes"]) ?? byteCount,
+            contentType: storedType.isEmpty ? contentType : storedType
         )
     }
 
     // MARK: listFiles
 
-    /// Lists stored files, optionally filtered by storage group.
+    /// Lists the files `options.configId` (default: the project key) can
+    /// access in `options.threadId` (required). Files carry no `readUrl`.
     public func listFiles(options: ListOptions = ListOptions()) async throws -> StorageFileList {
-        // Fixed parameter order; empty values are left out.
-        var query: [(String, String)] = []
-        if let configType = options.configType, !configType.rawValue.isEmpty {
-            query.append(("config_type", configType.rawValue))
-        }
-        if let configId = options.configId, !configId.isEmpty {
-            query.append(("config_id", configId))
-        }
+        let configId = try options.configId ?? Storage.credentials("call connect() before using storage").projectKey
+        let threadId = try Storage.requireThreadId(options.threadId)
+
+        var query = Storage.accessQuery(configId, threadId)
         if let page = options.page { query.append(("page", String(page))) }
-        if let limit = options.limit { query.append(("limit", String(limit))) }
-        let path = "/files" + (query.isEmpty ? "" : "?" + ArtEncoding.formQuery(query))
+        if let limit = options.limit { query.append(("page_size", String(limit))) }
+        let response = try await datalakeCall(.list, method: "GET", path: "/objects", query: query, timeoutMs: nil)
 
-        let data = try await storageCall(.list, method: "GET", path: path, timeoutMs: nil)
-
-        let files = (data["files"] as? [[String: Any]] ?? []).map { toStorageFile($0) }
-        return StorageFileList(files: files, total: ArtJSON.int(data["total"]) ?? 0)
+        let json = response as? [String: Any]
+        let files = (json?["data"] as? [[String: Any]] ?? []).map { toStorageFile($0) }
+        let total = ArtJSON.int((json?["meta"] as? [String: Any])?["total"]) ?? files.count
+        return StorageFileList(files: files, total: total)
     }
 
     // MARK: getFile
 
-    /// Fetches one file's metadata, including a signed `readUrl`.
-    public func getFile(fileId: String, timeoutMs: Int? = nil) async throws -> StorageFile {
-        let data = try await storageCall(
-            .get, method: "GET", path: "/file/\(ArtEncoding.uriComponent(fileId))",
-            timeoutMs: timeoutMs
+    /// Fetches the metadata and a read URL of the file `fileId` in
+    /// `threadId`.
+    public func getFile(fileId: String, threadId: String, timeoutMs: Int? = nil) async throws -> StorageFile {
+        let configId = try Storage.credentials("call connect() before using storage").projectKey
+        let thread = try Storage.requireThreadId(threadId)
+        let query = Storage.accessQuery(configId, thread)
+        let path = "/objects/\(ArtEncoding.uriComponent(fileId))"
+
+        let object = try await datalakeCall(.get, method: "GET", path: path, query: query, timeoutMs: timeoutMs)
+        let access = try await datalakeCall(
+            .get, method: "POST", path: "\(path)/access-url", query: query, timeoutMs: timeoutMs
         )
-        return toStorageFile(data["file"] as? [String: Any], readUrl: data["read_url"] as? String)
+        return toStorageFile(
+            Storage.dataObject(object),
+            readUrl: (access as? [String: Any])?["read_url"] as? String
+        )
     }
 
     // MARK: deleteFile
 
-    /// Deletes a file; `hard: true` removes it permanently.
+    /// Deletes the file `fileId`. `hard` is ignored: files are always
+    /// removed.
     public func deleteFile(fileId: String, hard: Bool = false, timeoutMs: Int? = nil) async throws {
-        let path = "/file/\(ArtEncoding.uriComponent(fileId))\(hard ? "/hard" : "")"
-        _ = try await storageCall(.delete, method: "DELETE", path: path, timeoutMs: timeoutMs)
+        _ = try await datalakeCall(
+            .delete, method: "DELETE",
+            path: "/objects/\(ArtEncoding.uriComponent(fileId))",
+            query: [], timeoutMs: timeoutMs
+        )
     }
 
     // MARK: - Private helpers
 
-    private func toStorageFile(_ f: [String: Any]?, readUrl: String? = nil) -> StorageFile {
+    private func toStorageFile(_ object: [String: Any], readUrl: String? = nil) -> StorageFile {
         StorageFile(
-            fileId: ArtJSON.string(f?["id"]) ?? "",
-            name: f?["original_name"] as? String ?? "",
-            configType: f?["config_type"] as? String ?? "",
-            configId: f?["config_id"] as? String ?? "",
-            size: ArtJSON.int(f?["file_size"]) ?? 0,
-            contentType: f?["content_type"] as? String ?? "",
-            status: f?["status"] as? String ?? "",
-            createdAt: f?["created_at"] as? String ?? "",
-            expiresAt: f?["expires_at"] as? String,
-            readUrl: readUrl ?? (f?["read_url"] as? String)
+            fileId: ArtJSON.string(object["id"]) ?? "",
+            name: object["name"] as? String ?? "",
+            configType: "media",
+            configId: object["owner_config_id"] as? String ?? "",
+            size: ArtJSON.int(object["size_bytes"]) ?? 0,
+            contentType: object["content_type"] as? String ?? "",
+            status: "active",
+            createdAt: object["created_at"] as? String ?? "",
+            expiresAt: object["expires_at"] as? String,
+            readUrl: readUrl
         )
     }
 
-    /// Authenticated call to the storage API; returns the `data` object.
-    private func storageCall(
+    private static func credentials(_ message: String) throws -> AuthenticationConfig {
+        do {
+            return try Auth.getInstance().getCredentials()
+        } catch {
+            throw UploadError(message, step: .validate)
+        }
+    }
+
+    private static func requireThreadId(_ threadId: String?) throws -> String {
+        let value = threadId?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !value.isEmpty else {
+            throw UploadError("threadId is required for temporary media", step: .validate)
+        }
+        return value
+    }
+
+    private static func accessQuery(_ configId: String, _ threadId: String) -> [(String, String)] {
+        [("accessible_by", configId), ("thread_id", threadId)]
+    }
+
+    private static func baseUrl(_ credentials: AuthenticationConfig) -> String {
+        "\(ArtGateway.restBase)/api/\(ArtEncoding.uriComponent(credentials.orgTitle))/datalake/v1/system-buckets/temp"
+    }
+
+    private static func dataObject(_ value: Any?) -> [String: Any] {
+        value as? [String: Any] ?? [:]
+    }
+
+    /// Calls the temporary-media bucket. Returns the response's `data`, or
+    /// `{data, meta}` for `.list`.
+    private func datalakeCall(
         _ step: UploadStep,
         method: String,
         path: String,
-        body: [String: Any]? = nil,
+        query: [(String, String)],
         timeoutMs: Int?
-    ) async throws -> [String: Any] {
-        let orgTitle: String
+    ) async throws -> Any? {
+        let credentials = try Storage.credentials("call connect() before using storage")
+        let endpoint = query.isEmpty ? path : "\(path)?\(ArtEncoding.formQuery(query))"
         do {
-            orgTitle = try Auth.getInstance().getCredentials().orgTitle
-        } catch {
-            throw UploadError("call connect() before using storage", step: .validate)
-        }
-
-        let baseUrl = "\(ArtGateway.restBase)/api/\(ArtEncoding.uriComponent(orgTitle))/storage"
-
-        do {
-            let json = try await httpCall(path, options: CallApiProps(
-                method: method, payload: body, baseUrl: baseUrl, timeoutMs: timeoutMs
+            let json = try await httpCall(endpoint, options: CallApiProps(
+                method: method, baseUrl: Storage.baseUrl(credentials), timeoutMs: timeoutMs
             ))
-            return (json as? [String: Any])?["data"] as? [String: Any] ?? [:]
-        } catch let error as HTTPCallError {
-            // Keep the status: a 403 on signed-url means the tenant role
-            // lacks storage permission.
-            throw UploadError(
-                "storage \(step.rawValue) failed: \(error.errorDescription ?? error.message)",
+            let map = json as? [String: Any] ?? [:]
+            if step == .list {
+                return ["data": map["data"] ?? [Any](), "meta": map["meta"] ?? [String: Any]()]
+            }
+            return map["data"]
+        } catch {
+            throw Storage.uploadError(step, error)
+        }
+    }
+
+    private static func uploadError(_ step: UploadStep, _ error: Error) -> Error {
+        switch error {
+        case let error as UploadError:
+            return error
+        case let error as HTTPCallError:
+            // Keep the status: a 403 means the tenant role lacks storage
+            // permission.
+            return UploadError(
+                "Datalake \(step.rawValue) failed: \(error.message)",
                 step: step, status: error.status, underlying: error
             )
-        } catch let error as UploadError {
-            throw error
-        } catch {
-            throw UploadError(
-                "storage \(step.rawValue) failed: \(error.localizedDescription)",
+        default:
+            return UploadError(
+                "Datalake \(step.rawValue) failed: \(error.localizedDescription)",
                 step: step, underlying: error
             )
         }
     }
 
-    /// PUT the bytes to the signed blob-storage URL, reporting progress via
-    /// `options.progress`. File bodies stream from disk.
-    private func putToStorage(
-        _ url: URL,
-        body: UploadBody,
+    /// POSTs the multipart upload with its own session so progress can be
+    /// reported; file bodies are staged in a temporary file and streamed.
+    private func sendUpload(
+        _ body: UploadBody,
+        fields: [(String, String)],
+        filename: String,
         contentType: String,
+        baseUrl: String,
         options: UploadOptions
-    ) async throws {
-        var request = URLRequest(url: url)
-        request.httpMethod = "PUT"
-        request.setValue("BlockBlob", forHTTPHeaderField: "x-ms-blob-type")
-        request.setValue(contentType, forHTTPHeaderField: "Content-Type")
-        request.timeoutInterval = TimeInterval(options.timeoutMs ?? 60_000) / 1000
+    ) async throws -> [String: Any] {
+        let multipart = MultipartBody()
+        var request: URLRequest
+        do {
+            request = try await artAuthorizedRequest("/objects", options: CallApiProps(
+                method: "POST", baseUrl: baseUrl, timeoutMs: options.timeoutMs ?? 60_000
+            ))
+        } catch {
+            throw Storage.uploadError(.upload, error)
+        }
+        request.setValue(multipart.contentType, forHTTPHeaderField: "Content-Type")
 
-        options.progress?(0)
+        var stagedFile: URL?
+        defer { if let stagedFile { try? FileManager.default.removeItem(at: stagedFile) } }
 
         let delegate = UploadProgressDelegate(progress: options.progress)
         let session = URLSession(configuration: ArtHTTP.uploadConfiguration, delegate: delegate, delegateQueue: nil)
         defer { session.finishTasksAndInvalidate() }
 
+        let data: Data
+        let response: URLResponse
         do {
-            let response: URLResponse
             switch body {
-            case .data(let data):
-                (_, response) = try await session.upload(for: request, from: data, delegate: delegate)
-            case .file(let fileURL):
-                (_, response) = try await session.upload(for: request, fromFile: fileURL, delegate: delegate)
-            }
-            guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
-                let status = (response as? HTTPURLResponse)?.statusCode
-                throw UploadError(
-                    "storage PUT failed (\(status.map(String.init) ?? "no response"))",
-                    step: .put, status: status
+            case .data(let bytes):
+                let file = FormDataFile(field: "file", data: bytes, filename: filename, contentType: contentType)
+                (data, response) = try await session.upload(
+                    for: request, from: multipart.encode(fields: fields, files: [file]), delegate: delegate
                 )
+            case .file(let fileURL):
+                let staged = FileManager.default.temporaryDirectory
+                    .appendingPathComponent("art-upload-\(UUID().uuidString)")
+                stagedFile = staged
+                try multipart.write(
+                    fields: fields, field: "file", filename: filename,
+                    contentType: contentType, source: fileURL, to: staged
+                )
+                (data, response) = try await session.upload(for: request, fromFile: staged, delegate: delegate)
             }
-            options.progress?(1)
-        } catch let error as UploadError {
-            throw error
         } catch let error as URLError where error.code == .timedOut {
-            throw UploadError("storage PUT timed out", step: .put, underlying: error)
+            throw UploadError("Datalake upload timed out", step: .upload, underlying: error)
         } catch {
-            throw UploadError("storage PUT failed (network/timeout)", step: .put, underlying: error)
+            throw Storage.uploadError(.upload, error)
+        }
+
+        do {
+            let json = try artDecodeResponse(data, response, endpoint: "/objects")
+            return Storage.dataObject((json as? [String: Any])?["data"])
+        } catch {
+            throw Storage.uploadError(.upload, error)
         }
     }
 }
 
-/// Reports fractional upload progress (0...1) during the PUT-to-blob step.
+/// Reports upload progress while the body is sent. `1` is left for the
+/// moment the server has stored the file.
 private final class UploadProgressDelegate: NSObject, URLSessionTaskDelegate {
     private let progress: ((Double) -> Void)?
 
@@ -317,7 +374,7 @@ private final class UploadProgressDelegate: NSObject, URLSessionTaskDelegate {
         totalBytesSent: Int64,
         totalBytesExpectedToSend: Int64
     ) {
-        guard totalBytesExpectedToSend > 0 else { return }
+        guard totalBytesExpectedToSend > 0, totalBytesSent < totalBytesExpectedToSend else { return }
         progress?(Double(totalBytesSent) / Double(totalBytesExpectedToSend))
     }
 }

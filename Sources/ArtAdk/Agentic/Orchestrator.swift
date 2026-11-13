@@ -14,7 +14,7 @@ import Foundation
 /// Typical use:
 ///
 /// ```swift
-/// let orch = adk.orchestrator("my-orchestrator")
+/// let orch = try adk.orchestrator("my-orchestrator")
 /// let thread = try await orch.thread()
 /// thread.listen { data in print("event: \(data["event"] ?? "")") }
 /// try await thread.push(event: "user_input",
@@ -22,12 +22,17 @@ import Foundation
 /// ```
 public final class Orchestrator: BaseWorkflow {
 
-    /// The server-side identifier for this orchestrator. Used to compute
-    /// the channel name `orch_com_<orchestratorId>`.
+    /// The orchestrator's slug, optionally with `@buildname`. Used to
+    /// compute the channel name `orch_com_<orchestratorId>`.
     public let orchestratorId: String
 
     /// Creates an `Orchestrator` bound to `socket`.
-    public init(_ orchestratorId: String, socket: Socket) {
+    ///
+    /// `orchestratorId` is the orchestrator's slug, optionally pinned to a
+    /// named build (`my-flow@release2`). Throws `ARTError.invalidArgument`
+    /// for anything else; see `validateExecutionReference(_:)`.
+    public init(_ orchestratorId: String, socket: Socket) throws {
+        try validateExecutionReference(orchestratorId)
         self.orchestratorId = orchestratorId
         super.init(socket: socket)
     }
@@ -50,12 +55,13 @@ public final class Orchestrator: BaseWorkflow {
 
     // MARK: - Storage (orchestrator-scoped)
 
-    /// Uploads a local file scoped to this orchestrator
-    /// (`config_id` = `orchestratorId`).
+    /// Uploads a local file owned by this orchestrator's channel
+    /// configuration. `options.threadId` is required;
+    /// `OrchestratorThread.upload` sets it.
     @discardableResult
     public func upload(fileURL: URL, options: UploadOptions = UploadOptions()) async throws -> FileRef {
         var opts = options
-        opts.configId = orchestratorId
+        opts.configId = try await getSubscription().configurationId
         return try await Storage().upload(fileURL: fileURL, options: opts)
     }
 
@@ -68,14 +74,16 @@ public final class Orchestrator: BaseWorkflow {
         options: UploadOptions = UploadOptions()
     ) async throws -> FileRef {
         var opts = options
-        opts.configId = orchestratorId
+        opts.configId = try await getSubscription().configurationId
         return try await Storage().upload(data: data, filename: filename, contentType: contentType, options: opts)
     }
 
-    /// Lists files scoped to this orchestrator.
+    /// Lists the files this orchestrator's channel configuration can access
+    /// in `options.threadId` (required; `OrchestratorThread.listFiles` sets
+    /// it).
     public func listFiles(options: ListOptions = ListOptions()) async throws -> StorageFileList {
         var opts = options
-        opts.configId = orchestratorId
+        opts.configId = try await getSubscription().configurationId
         return try await Storage().listFiles(options: opts)
     }
 }

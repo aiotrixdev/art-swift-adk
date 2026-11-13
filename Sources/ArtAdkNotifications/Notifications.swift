@@ -10,8 +10,6 @@
 //   let page = try await inbox.list()                          // history (REST)
 //   try await inbox.markRead([id])
 //   try await inbox.send(SendNotificationInput(recipients: ["bob"], type: "mention", title: t, body: b))
-//   try await inbox.registerDevice(RegisterDeviceInput(token: pushToken, platform: .ios))
-//   try await inbox.unregisterDevice(token: pushToken)         // on logout
 //
 // The adapter has no connection of its own: it rides the host Adk's
 // websocket, REST client and auth.
@@ -27,6 +25,12 @@ private let newNotificationEvent = "notification.new"
 /// Read state of a notification.
 public enum NotificationStatus: String, Sendable {
     case unread, read, archived
+}
+
+/// How a notification is delivered.
+public enum NotificationChannel: String, Sendable {
+    case inApp = "in_app"
+    case email
 }
 
 /// A notification delivered live or listed from history.
@@ -109,7 +113,7 @@ public struct SendNotificationInput {
     public var body: String
     public var data: [String: Any]?
     /// Delivery channels (sent as `notify_channels`); `nil` = in-app only.
-    public var channels: [String]?
+    public var channels: [NotificationChannel]?
     public var dedupKey: String?
 
     public init(
@@ -118,7 +122,7 @@ public struct SendNotificationInput {
         title: String,
         body: String,
         data: [String: Any]? = nil,
-        channels: [String]? = nil,
+        channels: [NotificationChannel]? = nil,
         dedupKey: String? = nil
     ) {
         self.recipients = recipients
@@ -135,53 +139,6 @@ public struct SendNotificationInput {
 public struct SendNotificationResult {
     public let created: Int
     public let skipped: Int
-}
-
-/// Push platform of a registered device.
-public enum DevicePlatform: String, Sendable {
-    case android, ios, web
-}
-
-/// Input for `registerDevice(_:)`.
-public struct RegisterDeviceInput {
-    public var token: String
-    public var platform: DevicePlatform
-    public var username: String?
-
-    public init(token: String, platform: DevicePlatform, username: String? = nil) {
-        self.token = token
-        self.platform = platform
-        self.username = username
-    }
-}
-
-/// A registered push device.
-public struct PushDevice {
-    public let id: String?
-    public let username: String
-    public let token: String
-    public let platform: String
-    public let provider: String?
-    public let createdAt: String?
-    public let lastSeenAt: String?
-    public let updatedAt: String?
-
-    init(from d: [String: Any]) {
-        id = stringValue(d["id"])
-        username = d["username"] as? String ?? ""
-        token = d["token"] as? String ?? ""
-        platform = d["platform"] as? String ?? ""
-        provider = d["provider"] as? String
-        createdAt = d["created_at"] as? String
-        lastSeenAt = d["last_seen_at"] as? String
-        updatedAt = d["updated_at"] as? String
-    }
-}
-
-/// A page of registered devices.
-public struct PushDeviceList {
-    public let devices: [PushDevice]
-    public let total: Int
 }
 
 // MARK: - API
@@ -279,7 +236,7 @@ public final class NotificationsApi {
         if let data = input.data { payload["data"] = data }
         // The trigger event binds `notify_channels`; a `channels` key is
         // ignored by the service (in-app only).
-        if let channels = input.channels { payload["notify_channels"] = channels }
+        if let channels = input.channels { payload["notify_channels"] = channels.map(\.rawValue) }
         if let dedupKey = input.dedupKey { payload["dedup_key"] = dedupKey }
 
         let data = try await call(path("/notify"), method: "POST", payload: payload)
@@ -287,37 +244,6 @@ public final class NotificationsApi {
             created: intValue(data["created"]) ?? 0,
             skipped: intValue(data["skipped"]) ?? 0
         )
-    }
-
-    // MARK: Push devices (REST, via the gateway)
-
-    /// Registers this device's push token. Idempotent (the service upserts
-    /// on the token) — call on every launch and on token rotation.
-    @discardableResult
-    public func registerDevice(_ input: RegisterDeviceInput) async throws -> PushDevice? {
-        var payload: [String: Any] = [
-            "token": input.token,
-            "platform": input.platform.rawValue,
-        ]
-        if let username = input.username, !username.isEmpty { payload["username"] = username }
-
-        let data = try await call(devicePath("/register"), method: "POST", payload: payload)
-        return (data["device"] as? [String: Any]).map(PushDevice.init(from:))
-    }
-
-    /// Removes a device token (call on logout). Returns the number of
-    /// deleted registrations.
-    @discardableResult
-    public func unregisterDevice(token: String) async throws -> Int {
-        let data = try await call(devicePath("/unregister"), method: "POST", payload: ["token": token])
-        return intValue(data["deleted"]) ?? 0
-    }
-
-    /// Lists the authenticated user's registered devices.
-    public func listDevices() async throws -> PushDeviceList {
-        let data = try await call(devicePath(), method: "GET")
-        let devices = (data["devices"] as? [[String: Any]] ?? []).map(PushDevice.init(from:))
-        return PushDeviceList(devices: devices, total: intValue(data["total"]) ?? 0)
     }
 
     // MARK: Internals
@@ -332,10 +258,6 @@ public final class NotificationsApi {
 
     private func path(_ suffix: String = "") throws -> String {
         "/api/\(encodePathComponent(try tenant()))/notifications\(suffix)"
-    }
-
-    private func devicePath(_ suffix: String = "") throws -> String {
-        "/api/\(encodePathComponent(try tenant()))/push-devices\(suffix)"
     }
 
     /// REST call through the host ADK; returns the response's `data` object,

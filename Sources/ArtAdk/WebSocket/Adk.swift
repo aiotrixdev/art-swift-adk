@@ -26,6 +26,12 @@ open class Adk {
     /// early-return while this is true.
     private var isLimitExceeded: Bool = false
     private var reconnectTask: Task<Void, Never>?
+    /// The connection attempt in flight; concurrent `connect()` calls and
+    /// reconnects join it.
+    private var connectionAttempt: Task<Void, Error>?
+    /// `(event, listener id)` pairs this instance registered on the shared
+    /// socket; `disconnect()` removes them and `connect()` adds them back.
+    private var socketListenerIds: [(event: String, id: UUID)] = []
     private var _state: AdkState = .stopped
     /// Credentials supplied via `setCredentials(_:)` or loaded from
     /// `adk-services.json`.
@@ -80,39 +86,129 @@ open class Adk {
             return try await self.decrypt(data, senderPublicKey: pubKey)
         }
 
-        _ = socket.on("connection") { [weak self] data in
-            if let conn = data as? ConnectionDetail {
-                self?.handleOnConnection(conn)
-            }
-        }
+        attachSocketListeners()
+    }
 
-        _ = socket.on("close") { [weak self] _ in
-            self?.handleOnClose()
-        }
-
-        _ = socket.on("limitExceeded") { [weak self] data in
-            guard let self else { return }
-            let info = data as? [String: String]
-            let code = info?["code"] ?? ""
-            let errText = info?["error"] ?? ""
-            let msg = code == "CONCURRENT_LIMIT_EXCEEDED"
-                ? "[ART] Concurrent connection limit reached: \(errText). All reconnection attempts stopped. Call connect() again to retry."
-                : "[ART] Billing limit reached: \(errText). All reconnection attempts permanently stopped."
-            print(msg)
-            self.lock.sync {
-                self.isLimitExceeded = true
-                self.isConnectable = false
-                self._state = .stopped
-            }
+    // MARK: - Socket listeners
+    private func attachSocketListeners() {
+        lock.sync {
+            guard socketListenerIds.isEmpty else { return }
+            socketListenerIds = [
+                ("connection", socket.on("connection") { [weak self] data in
+                    if let conn = data as? ConnectionDetail { self?.handleOnConnection(conn) }
+                }),
+                ("close", socket.on("close") { [weak self] _ in
+                    self?.handleOnClose()
+                }),
+                ("limitExceeded", socket.on("limitExceeded") { [weak self] data in
+                    self?.handleLimitExceeded(data)
+                }),
+                ("authenticationFailed", socket.on("authenticationFailed") { [weak self] data in
+                    self?.handleAuthenticationFailed(data)
+                }),
+                ("connectionFailed", socket.on("connectionFailed") { [weak self] _ in
+                    self?.handleConnectionFailed()
+                }),
+            ]
         }
     }
 
+    private func detachSocketListeners() {
+        let ids: [(event: String, id: UUID)] = lock.sync {
+            let ids = socketListenerIds
+            socketListenerIds = []
+            return ids
+        }
+        for (event, id) in ids { socket.off(event, id: id) }
+    }
+
+    private func handleLimitExceeded(_ data: Any) {
+        let info = data as? [String: String]
+        let code = info?["code"] ?? ""
+        let errText = info?["error"] ?? ""
+        let msg = code == "CONCURRENT_LIMIT_EXCEEDED"
+            ? "[ART] Concurrent connection limit reached: \(errText). All reconnection attempts stopped. Call connect() again to retry."
+            : "[ART] Billing limit reached: \(errText). All reconnection attempts permanently stopped."
+        ArtLog.error(msg)
+        lock.sync {
+            isLimitExceeded = true
+            isConnectable = false
+            _state = .stopped
+        }
+        cancelReconnect()
+    }
+
+    private func handleAuthenticationFailed(_ data: Any) {
+        let detail = data as? AuthenticationFailedDetail
+        let status = detail.map { $0.status != 0 ? " with HTTP \($0.status)" : "" } ?? ""
+        ArtLog.error(
+            "[ART] Authentication rejected\(status): \(detail?.error ?? "\(data)"). " +
+            "Automatic reconnection has been stopped. Update the credentials and call connect() again."
+        )
+        lock.sync {
+            isConnectable = false
+            _state = .stopped
+        }
+        cancelReconnect()
+        socket.isReConnecting = false
+    }
+
+    private func handleConnectionFailed() {
+        lock.sync {
+            isConnectable = false
+            _state = .stopped
+        }
+        cancelReconnect()
+    }
+
+    private func cancelReconnect() {
+        let task: Task<Void, Never>? = lock.sync {
+            let task = reconnectTask
+            reconnectTask = nil
+            return task
+        }
+        task?.cancel()
+    }
+
     // MARK: - connect
-    /// Connects using, in order of precedence: `AdkConfig.getCredentials`,
-    /// credentials from `setCredentials(_:)`, or `adk-services.json`
-    /// (loaded when `autoLoadCredsFromJSON` is set, or — Swift
-    /// compatibility — when no credentials were supplied at all).
-    public func connect(config: ConnectConfig? = nil) async {
+    /// Opens the connection to the ART server and returns once it is ready.
+    ///
+    /// Credentials come from, in order of precedence:
+    /// `AdkConfig.getCredentials`, `setCredentials(_:)`, or
+    /// `adk-services.json` (loaded when `autoLoadCredsFromJSON` is set, or
+    /// when no credentials were supplied at all).
+    ///
+    /// This is also how to recover after `connectionFailed`: it clears the
+    /// failure and starts over. A call made while an attempt is in flight
+    /// joins it; a call while connected returns at once.
+    ///
+    /// Throws a `ConnectionError` when the attempt fails: code
+    /// `AUTHENTICATION_FAILED` when the credentials are missing or the
+    /// server rejects them (the `authenticationFailed` event fires too), or
+    /// `CONNECTION_TIMEOUT` when the connection is not ready within
+    /// `AdkConfig.connectionTimeoutMs`. Throws `ARTError.invalidArgument`
+    /// when `connectionTimeoutMs` is not positive.
+    public func connect(config: ConnectConfig? = nil) async throws {
+        if let attempt = lock.sync({ connectionAttempt }) {
+            return try await attempt.value
+        }
+        attachSocketListeners()
+        if socket.isConnectionActive {
+            lock.sync {
+                isConnectable = true
+                _state = .connected
+            }
+            return
+        }
+        cancelReconnect()
+        lock.sync {
+            isPaused = false
+            isLimitExceeded = false
+            reconnectAttempts = 0
+            reconnectDelay = 3000
+        }
+        try socket.beginConnection(timeoutMs: adkConfig?.connectionTimeoutMs ?? 30_000)
+
         if adkConfig?.getCredentials == nil {
             let hasCredentials = lock.sync { credentialData != nil }
             if adkConfig?.autoLoadCredsFromJSON == true || !hasCredentials {
@@ -126,10 +222,45 @@ open class Adk {
             isConnectable = true
             _state = .connecting
         }
-        await initiateSocketConnection()
-        if socket.isConnectionActive {
-            lock.sync { if _state == .connecting { _state = .connected } }
+        do {
+            try await attemptConnection()
+            lock.sync { _state = settledState() }
+        } catch {
+            lock.sync { _state = .stopped }
+            throw error
         }
+    }
+
+    /// Opens the transport and waits until the connection is ready, sharing
+    /// one attempt between concurrent callers. The readiness wait starts
+    /// together with the attempt, so it bounds authentication too.
+    private func attemptConnection() async throws {
+        let attempt: Task<Void, Error> = lock.sync {
+            if let running = connectionAttempt { return running }
+            let socket = self.socket
+            let started = Task {
+                try await withThrowingTaskGroup(of: Void.self) { group in
+                    group.addTask { try await self.initiateSocketConnection() }
+                    group.addTask { try await socket.wait() }
+                    try await group.waitForAll()
+                }
+            }
+            connectionAttempt = started
+            return started
+        }
+        do {
+            try await attempt.value
+            lock.sync { if connectionAttempt == attempt { connectionAttempt = nil } }
+        } catch {
+            lock.sync { if connectionAttempt == attempt { connectionAttempt = nil } }
+            throw error
+        }
+    }
+
+    /// `state` after a connection attempt returned. Call with `lock` held.
+    private func settledState() -> AdkState {
+        if socket.isConnectionActive { return .connected }
+        return isConnectable ? .connecting : .stopped
     }
 
     /// Supplies credentials for `connect()`. The
@@ -142,48 +273,50 @@ open class Adk {
     }
 
     // MARK: - pause
-    /// Closes the connection and suspends auto-reconnection until
-    /// `resume()`.
+    /// Closes the connection, keeping subscriptions, and suspends
+    /// auto-reconnection until `resume()`.
+    ///
+    /// The connection fails with `CONNECTION_PAUSED`, so active agent runs
+    /// end with an error. No-op if already paused.
     public func pause() {
         let shouldPause: Bool = lock.sync {
             guard !isPaused else { return false }
             isPaused = true
+            isConnectable = false
             reconnectAttempts = maxReconnectAttempts
-            _state = .paused
             return true
         }
         guard shouldPause else { return }
-        reconnectTask?.cancel()
-        Task { await socket.closeWebSocket() }
+        cancelReconnect()
+        socket.failConnection(ConnectionError("The connection is paused.", code: "CONNECTION_PAUSED"))
+        lock.sync { _state = .paused }
     }
 
     // MARK: - resume
-    public func resume() async {
-        let shouldResume: Bool = lock.sync {
-            guard isPaused else { return false }
-            isPaused = false
-            reconnectAttempts = 0
-            reconnectDelay    = 3000
-            _state = .connecting
-            return true
-        }
-        guard shouldResume else { return }
-        try? await socket.connectWebSocket()
-        if socket.isConnectionActive {
-            lock.sync { if _state == .connecting { _state = .connected } }
-        }
+    /// Reconnects after `pause()` (see `connect()`). No-op if not paused.
+    public func resume() async throws {
+        guard lock.sync({ isPaused }) else { return }
+        try await connect()
     }
 
     // MARK: - disconnect
+    /// Tears down the connection, subscriptions and interceptors, and
+    /// removes this instance's own listeners from the shared socket.
+    ///
+    /// The connection fails with `CONNECTION_CLOSED`, so active agent runs
+    /// end with an error. Call `connect()` to use the instance again;
+    /// listeners the app added with `on(_:handler:)` stay registered.
     public func disconnect() async {
         lock.sync {
             isConnectable = false
             reconnectAttempts = maxReconnectAttempts
-            _state = .stopped
         }
-        reconnectTask?.cancel()
+        cancelReconnect()
+        socket.failConnection(ConnectionError("The connection was closed.", code: "CONNECTION_CLOSED"))
         await socket.closeWebSocket(clearConnection: true)
+        lock.sync { _state = .stopped }
         socket.isConnectionActive = false
+        detachSocketListeners()
     }
 
     // MARK: - getState
@@ -198,7 +331,7 @@ open class Adk {
     }
 
     // MARK: - Private: initiate socket connection
-    private func initiateSocketConnection() async {
+    private func initiateSocketConnection() async throws {
 
         var authConfig: AuthenticationConfig
 
@@ -229,13 +362,18 @@ open class Adk {
 
         } else {
             ArtLog.error("Configuration not loaded — call setCredentials(_:), set AdkConfig.getCredentials, or provide adk-services.json")
-            lock.sync { _state = .stopped }
-            return
+            let error = ConnectionError(
+                "Connection credentials are missing. Please sign in again.",
+                code: "AUTHENTICATION_FAILED"
+            )
+            socket.failConnection(error)
+            throw error
         }
 
         authConfig.config = adkConfig
         authConfig.getCredentials = adkConfig?.getCredentials
-        await socket.initiateSocket(credentials: authConfig)
+        try await socket.initiateSocket(credentials: authConfig)
+        try await socket.wait()
     }
 
     // MARK: - onReconnected (re-establish notifications)
@@ -256,6 +394,7 @@ open class Adk {
 
     // MARK: - Connection event handlers
     private func handleOnConnection(_ connection: ConnectionDetail) {
+        cancelReconnect()
         let (wasReconnect, handlers) = lock.sync { () -> (Bool, [() -> Void]) in
             let wasReconnect = hasConnectedOnce
             hasConnectedOnce = true
@@ -277,6 +416,8 @@ open class Adk {
             // Paused: stay closed until resume().
             if isPaused { return false }
             guard isConnectable else { _state = .stopped; return false }
+            // The attempt in flight reports its own outcome.
+            if connectionAttempt != nil { return false }
             _state = .connecting
             return true
         }
@@ -285,34 +426,64 @@ open class Adk {
         handleReconnection()
     }
 
+    /// Schedules the next reconnect attempt; after `maxReconnectAttempts`
+    /// the connection fails with `CONNECTION_LOST`.
     private func handleReconnection() {
-        reconnectTask?.cancel()
-        reconnectTask = Task { [weak self] in
-            guard let self else { return }
-            let (delayMs, growDelay, attempt): (Double, Bool, Int) = self.lock.sync {
-                if self.reconnectAttempts < self.maxReconnectAttempts {
-                    self.reconnectAttempts += 1
-                    return (self.reconnectDelay, true, self.reconnectAttempts)
+        enum Step { case skip, giveUp, retry(delayMs: Double, attempt: Int) }
+        let step: Step = lock.sync {
+            if isLimitExceeded || !isConnectable || isPaused || reconnectTask != nil { return .skip }
+            guard reconnectAttempts < maxReconnectAttempts else { return .giveUp }
+            reconnectAttempts += 1
+            let delayMs = reconnectDelay
+            let attempt = reconnectAttempts
+            reconnectTask = Task { [weak self] in
+                try? await Task.sleep(nanoseconds: UInt64(delayMs * 1_000_000))
+                guard let self, !Task.isCancelled else { return }
+                let stillWanted: Bool = self.lock.sync {
+                    self.reconnectTask = nil
+                    guard self.isConnectable, !self.isPaused, !self.isLimitExceeded else { return false }
+                    self._state = .connecting
+                    // Linear backoff, capped at maxDelay
+                    self.reconnectDelay = min(self.reconnectDelay + 2000, self.maxDelay)
+                    return true
                 }
-                return (self.maxDelay, false, self.reconnectAttempts)
+                guard stillWanted else { return }
+                do {
+                    try await self.attemptConnection()
+                    self.lock.sync { self._state = self.settledState() }
+                } catch {
+                    if self.lock.sync({ self.isConnectable }) { self.handleReconnection() }
+                }
             }
-            if growDelay {
-                ArtLog.info("Attempting to reconnect in \(delayMs / 1000) seconds... (Attempt \(attempt))")
-            } else {
-                ArtLog.warn("Max reconnection attempts reached. Will retry every \(self.maxDelay / 1000) seconds.")
-            }
-            try? await Task.sleep(nanoseconds: UInt64(delayMs * 1_000_000))
-            let stillWanted = self.lock.sync { self.isConnectable && !self.isPaused && !self.isLimitExceeded }
-            guard !Task.isCancelled, stillWanted else { return }
-            await self.connect()
-            if growDelay {
-                // Linear backoff, capped at maxDelay
-                self.lock.sync { self.reconnectDelay = min(self.reconnectDelay + 2000, self.maxDelay) }
-            }
+            return .retry(delayMs: delayMs, attempt: attempt)
+        }
+        switch step {
+        case .skip:
+            return
+        case .giveUp:
+            socket.failConnection(ConnectionError(
+                "The connection could not be restored. Please reconnect to check your execution.",
+                code: "CONNECTION_LOST"
+            ))
+        case .retry(let delayMs, let attempt):
+            ArtLog.info("Attempting to reconnect in \(delayMs / 1000) seconds... (Attempt \(attempt))")
         }
     }
 
     // MARK: - on / off  (event subscriptions)
+    /// Registers `handler` for a connection event: `connection`
+    /// (`ConnectionDetail`), `open`, `close`, `error`, `limitExceeded`,
+    /// `authenticationFailed` (`AuthenticationFailedDetail`) or
+    /// `connectionFailed` (`ConnectionError`).
+    ///
+    /// `close` reports a closure the ADK may still recover from by
+    /// reconnecting. `connectionFailed` reports that the connection is gone
+    /// for good: the credentials were rejected, a limit was reached, the
+    /// connection was paused or closed, or it could not be restored in
+    /// time. Active agent runs then end with an `agent_error` whose details
+    /// have `source: connection`, and waits, sends and subscriptions throw
+    /// the same `ConnectionError`. Fix the cause and call `connect()` to
+    /// recover. Returns a token for `off(_:id:)`.
     @discardableResult
     public func on(_ event: String, handler: @escaping (Any) -> Void) -> UUID {
         return socket.on(event, handler: handler)
@@ -336,8 +507,12 @@ open class Adk {
     /// Returns an `Agent` handle for talking to the named agent over its
     /// dedicated `agent_com_<agentId>` channel. The agent subscribes lazily
     /// on first use of its thread.
-    public func agent(_ agentId: String) -> Agent {
-        return Agent(agentId, socket: socket)
+    ///
+    /// `agentId` is the agent's slug, optionally pinned to a named build
+    /// (`my-agent@release2`); anything else throws
+    /// `ARTError.invalidArgument` (see `validateExecutionReference(_:)`).
+    public func agent(_ agentId: String) throws -> Agent {
+        return try Agent(agentId, socket: socket)
     }
 
     // MARK: - orchestrator
@@ -345,8 +520,11 @@ open class Adk {
     /// over its dedicated `orch_com_<orchestratorId>` channel. Subscribes
     /// lazily on first call to `Orchestrator.thread(...)`; bypasses the
     /// channel-level `orchestratorEnabled` gate.
-    public func orchestrator(_ orchestratorId: String) -> Orchestrator {
-        return Orchestrator(orchestratorId, socket: socket)
+    ///
+    /// `orchestratorId` is a slug, optionally with `@buildname`, like the
+    /// agent id in `agent(_:)`.
+    public func orchestrator(_ orchestratorId: String) throws -> Orchestrator {
+        return try Orchestrator(orchestratorId, socket: socket)
     }
 
     // MARK: - connector
@@ -386,7 +564,16 @@ open class Adk {
     }
 
     // MARK: - closeWebSocket
-    public func closeWebSocket() async { await socket.closeWebSocket() }
+    /// Closes the connection without clearing subscriptions. The connection
+    /// fails with `CONNECTION_CLOSED` and does not reconnect until
+    /// `connect()` is called.
+    public func closeWebSocket() async {
+        lock.sync { isConnectable = false }
+        cancelReconnect()
+        socket.failConnection(ConnectionError("The connection was closed.", code: "CONNECTION_CLOSED"))
+        await socket.closeWebSocket()
+        lock.sync { _state = .stopped }
+    }
 
     // MARK: - pushForSecureLine (protected helper for child classes)
     public func pushForSecureLine(event: String, data: Any, listen: Bool = false) async throws -> Any? {
@@ -532,9 +719,9 @@ open class Adk {
     }
 
     // MARK: - Storage
-    // Unscoped storage (`config_id` defaults to the project key). Scoped
-    // variants live on Agent, AgentThread, Orchestrator, OrchestratorThread
-    // and Subscription.
+    // Temporary media for a thread (`options.threadId` is required), owned
+    // by `configId` — the project key by default. Scoped variants live on
+    // Agent, AgentThread, Orchestrator, OrchestratorThread and Subscription.
 
     /// Uploads a local file. See `Storage.upload(fileURL:options:)`.
     @discardableResult
@@ -553,17 +740,19 @@ open class Adk {
         try await Storage().upload(data: data, filename: filename, contentType: contentType, options: options)
     }
 
-    /// Lists stored files.
+    /// Lists the files in `options.threadId` (required) that
+    /// `options.configId` (the project key by default) can access.
     public func listFiles(options: ListOptions = ListOptions()) async throws -> StorageFileList {
         try await Storage().listFiles(options: options)
     }
 
-    /// Fetches one file's metadata, including a signed `readUrl`.
-    public func getFile(fileId: String, timeoutMs: Int? = nil) async throws -> StorageFile {
-        try await Storage().getFile(fileId: fileId, timeoutMs: timeoutMs)
+    /// Fetches the metadata and a read URL of the file `fileId` in
+    /// `threadId`.
+    public func getFile(fileId: String, threadId: String, timeoutMs: Int? = nil) async throws -> StorageFile {
+        try await Storage().getFile(fileId: fileId, threadId: threadId, timeoutMs: timeoutMs)
     }
 
-    /// Deletes a file; `hard: true` removes it permanently.
+    /// Deletes a file. `hard` is ignored: files are always removed.
     public func deleteFile(fileId: String, hard: Bool = false, timeoutMs: Int? = nil) async throws {
         try await Storage().deleteFile(fileId: fileId, hard: hard, timeoutMs: timeoutMs)
     }

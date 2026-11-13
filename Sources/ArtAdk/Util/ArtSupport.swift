@@ -44,6 +44,20 @@ public enum ArtLog {
     static func error(_ message: @autoclosure () -> String) { handler?(.error, message()) }
 }
 
+// MARK: - Errors
+
+/// The readable message of an SDK error (`ConnectionError`,
+/// `AuthHttpError`, `ARTError`), without a kind prefix; `nil` for other
+/// errors.
+func artErrorMessage(_ error: Error) -> String? {
+    switch error {
+    case let error as ConnectionError: return error.message
+    case let error as AuthHttpError: return error.message
+    case let error as ARTError: return error.message
+    default: return nil
+    }
+}
+
 // MARK: - Wire encoding
 
 enum ArtEncoding {
