@@ -27,6 +27,7 @@ public final class OrchestratorThread {
     /// individually on `dispose()` so other threads keep theirs.
     private var traceTokens: [UUID] = []
     private var stateBindToken: UUID?
+    private var connectionListenerId: UUID?
     private var disposed = false
     private let stateStore: ThreadStateStore
 
@@ -36,6 +37,41 @@ public final class OrchestratorThread {
         self.subscription = subscription
         self.threadId = threadId ?? AgentThread.generateThreadId()
         self.stateStore = ThreadStateStore(threadId: self.threadId, enforcesSequence: false)
+        let id = subscription.onConnectionFailure { [weak self] error in
+            self?.handleConnectionFailure(error)
+        }
+        lock.sync { connectionListenerId = id }
+    }
+
+    /// Fails a request in progress when the connection fails: the state
+    /// becomes `failed` (source `client`) and `listen` callbacks get an
+    /// `agent_error` whose details carry `source: connection` and
+    /// `execution_status: unknown`, since the client can no longer tell
+    /// whether the server finished the execution.
+    private func handleConnectionFailure(_ error: ConnectionError) {
+        guard !isDisposed else { return }
+        switch stateStore.state.phase {
+        case .idle, .completed, .failed, .cancelled: return
+        default: break
+        }
+        stateStore.transition(.failed, .client, "Connection unavailable", reason: error.message)
+        var details: [String: Any] = [
+            "source": "connection",
+            "execution_status": "unknown",
+            "reason": error.message,
+        ]
+        if let status = error.status { details["status"] = status }
+        subscription.emitter.emit("\(threadId)-all", [
+            "event": "agent_error",
+            "content": [
+                "type": "agent_error_response",
+                "status": "error",
+                "code": error.code,
+                "message": error.message,
+                "thread_id": threadId,
+                "details": details,
+            ] as [String: Any],
+        ] as [String: Any])
     }
 
     /// Whether `dispose()` has been called.
@@ -60,9 +96,13 @@ public final class OrchestratorThread {
 
     /// Sends a message tagged with this thread's `threadId`.
     ///
-    /// Caller `options` (`to`, `fileMeta`) are kept; `threadID` is always
-    /// this thread's id to prevent cross-thread leakage. Records a
-    /// `submitted` state.
+    /// Caller `options` (`to`, `fileMeta`, `executionOrigin`) are kept;
+    /// `threadID` is always this thread's id to prevent cross-thread
+    /// leakage. Records a `submitted` state.
+    ///
+    /// When sending fails the state becomes `failed` and the error is
+    /// rethrown; a `ConnectionError` is also reported to `listen` callbacks
+    /// as an `agent_error`. The message is never resent.
     public func push(
         event: String,
         data: [String: Any],
@@ -72,18 +112,30 @@ public final class OrchestratorThread {
         var merged = options ?? PushConfig()
         merged.threadID = threadId
         stateStore.transition(.submitted, .client, "Request submitted")
-        try await subscription.push(event: event, data: data, options: merged)
+        do {
+            try await subscription.push(event: event, data: data, options: merged)
+        } catch {
+            if let connectionError = error as? ConnectionError {
+                handleConnectionFailure(connectionError)
+            } else {
+                stateStore.transition(
+                    .failed, .client, "Request could not be sent",
+                    reason: artErrorMessage(error) ?? error.localizedDescription
+                )
+            }
+            throw error
+        }
     }
 
     // MARK: - Storage (thread-scoped)
 
-    /// Uploads a local file scoped to this thread (`config_id` = threadId).
+    /// Uploads a local file for this thread, owned by the channel's
+    /// configuration (`options.configId` and `options.threadId` are always
+    /// set).
     @discardableResult
     public func upload(fileURL: URL, options: UploadOptions = UploadOptions()) async throws -> FileRef {
         try ensureActive()
-        var opts = options
-        opts.configId = threadId
-        return try await Storage().upload(fileURL: fileURL, options: opts)
+        return try await Storage().upload(fileURL: fileURL, options: try scoped(options))
     }
 
     /// In-memory variant of `upload(fileURL:options:)`.
@@ -95,17 +147,27 @@ public final class OrchestratorThread {
         options: UploadOptions = UploadOptions()
     ) async throws -> FileRef {
         try ensureActive()
-        var opts = options
-        opts.configId = threadId
-        return try await Storage().upload(data: data, filename: filename, contentType: contentType, options: opts)
+        return try await Storage().upload(
+            data: data, filename: filename, contentType: contentType,
+            options: try scoped(options)
+        )
     }
 
-    /// Lists files scoped to this thread.
+    /// Lists this thread's files that the channel's configuration can
+    /// access.
     public func listFiles(options: ListOptions = ListOptions()) async throws -> StorageFileList {
         try ensureActive()
         var opts = options
-        opts.configId = threadId
+        opts.configId = try subscription.configurationId
+        opts.threadId = threadId
         return try await Storage().listFiles(options: opts)
+    }
+
+    private func scoped(_ options: UploadOptions) throws -> UploadOptions {
+        var opts = options
+        opts.configId = try subscription.configurationId
+        opts.threadId = threadId
+        return opts
     }
 
     // MARK: - Listeners
@@ -204,17 +266,23 @@ public final class OrchestratorThread {
     /// Detaches all listeners attached through this thread and unregisters
     /// the thread from its parent subscription. Idempotent.
     public func dispose() {
-        let snapshot: (events: Set<String>, traceTokens: [UUID])? = lock.sync {
+        let snapshot: (events: Set<String>, traceTokens: [UUID], connection: UUID?)? = lock.sync {
             guard !disposed else { return nil }
             disposed = true
             let events = attachedEvents
             let tokens = traceTokens
+            let connection = connectionListenerId
             attachedEvents.removeAll()
             traceTokens.removeAll()
             stateBindToken = nil
-            return (events, tokens)
+            connectionListenerId = nil
+            return (events, tokens, connection)
         }
         guard let snapshot else { return }
+
+        if let connection = snapshot.connection {
+            subscription.offConnectionFailure(connection)
+        }
 
         for event in snapshot.events {
             subscription.detachThreadListener(threadId, event)

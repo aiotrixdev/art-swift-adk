@@ -153,6 +153,13 @@ public final class Run {
         settle(.failure(RunLifecycleError.superseded(reason)))
     }
 
+    /// Ends the run with `RunLifecycleError.closed`: its thread was disposed
+    /// or its request could not be sent.
+    func abort(_ reason: String) {
+        guard markClosed() else { return }
+        settle(.failure(RunLifecycleError.closed(reason)))
+    }
+
     /// Marks the run closed and cancels the HITL timer. Returns `false`
     /// when it was already closed.
     private func markClosed() -> Bool {

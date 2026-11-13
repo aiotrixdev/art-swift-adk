@@ -15,22 +15,31 @@ public struct AdkConfig: Encodable {
     public var root: String?
     /// Load credentials from `adk-services.json` on `connect()`.
     public var autoLoadCredsFromJSON: Bool
+    /// Longest wait, in milliseconds, for the connection to become ready,
+    /// for an authentication request, and for a reply to a control request
+    /// such as a subscribe. Defaults to 30 seconds and must be positive.
+    ///
+    /// This bounds connection set-up only; it is not a limit on how long an
+    /// execution may run.
+    public var connectionTimeoutMs: Int
 
     public init(
         uri: String,
         authToken: String? = nil,
         getCredentials: (() -> CredentialStore)? = nil,
         root: String? = nil,
-        autoLoadCredsFromJSON: Bool = false
+        autoLoadCredsFromJSON: Bool = false,
+        connectionTimeoutMs: Int = 30_000
     ) {
         self.uri = uri
         self.authToken = authToken
         self.getCredentials = getCredentials
         self.root = root
         self.autoLoadCredsFromJSON = autoLoadCredsFromJSON
+        self.connectionTimeoutMs = connectionTimeoutMs
     }
     enum CodingKeys: String, CodingKey {
-            case uri, authToken, root, autoLoadCredsFromJSON
+            case uri, authToken, root, autoLoadCredsFromJSON, connectionTimeoutMs
         }
 }
 
